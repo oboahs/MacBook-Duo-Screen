@@ -34,6 +34,7 @@ CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 BINARY="$MACOS_DIR/MacBookDuoScreen"
 PLIST="$CONTENTS_DIR/Info.plist"
+PLIST_EXPECTED="$BUILD_DIR/Info.plist.expected"
 SIGNING_MODE_FILE="$BUILD_DIR/signing-mode.txt"
 
 mkdir -p "$MACOS_DIR"
@@ -64,8 +65,8 @@ else
   done
 fi
 
-write_plist() {
-  cat > "$PLIST" <<'PLIST_EOF'
+render_plist() {
+  cat <<'PLIST_EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -102,7 +103,6 @@ PLIST_EOF
 }
 
 find_stable_signing_identity() {
-  # Explicit override for advanced/local development use.
   if [ -n "${MDS_SIGNING_IDENTITY:-}" ]; then
     printf '%s\n' "$MDS_SIGNING_IDENTITY"
     return 0
@@ -111,9 +111,6 @@ find_stable_signing_identity() {
   local identities
   identities="$(security find-identity -v -p codesigning 2>/dev/null || true)"
 
-  # Prefer a normal Apple Development identity. It gives the app a stable
-  # designated requirement, so TCC can remember Screen Recording permission
-  # across rebuilds. Older Xcode certificates used the Mac Developer name.
   local identity
   identity="$(printf '%s\n' "$identities" | sed -n 's/.*"\(Apple Development: [^"]*\)".*/\1/p' | head -n 1)"
   if [ -z "$identity" ]; then
@@ -135,21 +132,16 @@ sign_app() {
     if codesign --force --deep --sign "$stable_identity" \
         --identifier com.oboahs.MacBookDuoScreen "$APP_DIR"; then
       printf 'stable:%s\n' "$stable_identity" > "$SIGNING_MODE_FILE"
-      echo "✓ 稳定签名完成（屏幕录制权限可跨后续构建保留）"
+      echo "✓ 稳定签名完成"
       return 0
     fi
     echo "⚠ 稳定签名失败，将退回临时签名。"
   fi
 
-  # Ad-hoc signing is enough to run locally, but its designated requirement is
-  # tied to this exact build. macOS may therefore ask for Screen Recording again
-  # after the source code changes and the binary is rebuilt.
   if codesign --force --deep --sign - \
       --identifier com.oboahs.MacBookDuoScreen "$APP_DIR" >/dev/null 2>&1; then
     printf 'adhoc\n' > "$SIGNING_MODE_FILE"
-    echo "⚠ 当前使用临时 ad-hoc 签名。"
-    echo "  本次构建授权后可正常使用，但下一次源码更新重新编译时，macOS 可能再次要求屏幕录制权限。"
-    echo "  如果钥匙串中安装 Apple Development 证书，脚本会自动切换到稳定签名。"
+    echo "✓ 本地临时签名完成"
     return 0
   fi
 
@@ -157,7 +149,19 @@ sign_app() {
   return 1
 }
 
-write_plist
+# IMPORTANT: Never rewrite files inside a signed .app unless their contents
+# actually changed. TCC identifies privacy-sensitive apps using their signed code
+# identity. Rewriting Info.plist after signing breaks the bundle's resource seal
+# even when the text written is identical.
+render_plist > "$PLIST_EXPECTED"
+PLIST_CHANGED=0
+if [ ! -f "$PLIST" ] || ! cmp -s "$PLIST_EXPECTED" "$PLIST"; then
+  cp "$PLIST_EXPECTED" "$PLIST"
+  PLIST_CHANGED=1
+fi
+rm -f "$PLIST_EXPECTED"
+
+NEED_SIGN="$PLIST_CHANGED"
 
 if [ "$NEED_BUILD" -eq 1 ]; then
   clear
@@ -186,23 +190,33 @@ if [ "$NEED_BUILD" -eq 1 ]; then
 
   chmod +x "$BINARY"
   echo "✓ 编译完成"
+  NEED_SIGN=1
+fi
 
+# The previous launcher rewrote Info.plist on every launch, which invalidated the
+# existing signature. Repair that once, then keep the bundle byte-for-byte stable.
+if [ -x "$BINARY" ] && ! codesign --verify --deep --strict "$APP_DIR" >/dev/null 2>&1; then
+  echo "检测到 App 签名失效，正在修复……"
+  NEED_SIGN=1
+fi
+
+# If a stable identity becomes available later, upgrade without rebuilding.
+STABLE_IDENTITY="$(find_stable_signing_identity)"
+CURRENT_SIGNING_MODE="$(cat "$SIGNING_MODE_FILE" 2>/dev/null || true)"
+if [ -n "$STABLE_IDENTITY" ] && [ "$CURRENT_SIGNING_MODE" != "stable:$STABLE_IDENTITY" ]; then
+  echo "检测到稳定代码签名证书，正在升级现有 App 签名……"
+  NEED_SIGN=1
+fi
+
+if [ "$NEED_SIGN" -eq 1 ]; then
   if ! sign_app; then
     pause_before_exit
     exit 1
   fi
-else
-  # A developer certificate may have been created after this binary was already
-  # built with ad-hoc signing. Upgrade the existing .app immediately instead of
-  # waiting for another source-code change to trigger a rebuild.
-  STABLE_IDENTITY="$(find_stable_signing_identity)"
-  CURRENT_SIGNING_MODE="$(cat "$SIGNING_MODE_FILE" 2>/dev/null || true)"
-  if [ -n "$STABLE_IDENTITY" ] && [ "$CURRENT_SIGNING_MODE" != "stable:$STABLE_IDENTITY" ]; then
-    echo "检测到稳定代码签名证书，正在升级现有 App 签名……"
-    if ! sign_app; then
-      pause_before_exit
-      exit 1
-    fi
+  if ! codesign --verify --deep --strict "$APP_DIR" >/dev/null 2>&1; then
+    echo "错误：签名后验证仍未通过。"
+    pause_before_exit
+    exit 1
   fi
 fi
 
@@ -225,9 +239,8 @@ fi
 
 echo "✓ MacBook Duo Screen 2.0 已启动。"
 if [ -f "$SIGNING_MODE_FILE" ] && grep -q '^adhoc' "$SIGNING_MODE_FILE"; then
-  echo "提示：当前构建使用临时签名；源码再次更新并重新编译后，macOS 可能要求重新授权屏幕录制。"
+  echo "当前为本地临时签名；只要源码/Info.plist 不变化，同一构建不会在启动时被重新签名或改写。"
 fi
 echo "请点击菜单栏角度，选择“启用视觉锁定”。"
-echo "若首次授权屏幕录制，授权后请退出应用并重新双击 Run.command。"
 echo "这个终端窗口可以直接关闭。"
 exit 0
