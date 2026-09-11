@@ -1,15 +1,17 @@
 import AppKit
 import MetalKit
+import MetalPerformanceShaders
 import CoreVideo
 import Foundation
 
 struct PerspectiveUniforms {
     var amount: Float = 0
     var perspective: Float = 0.75
-    var softness: Float = 0.25
+    var softness: Float = 0.60
     var dimming: Float = 0.15
     var size = SIMD2<Float>(1, 1)
-    var padding = SIMD2<Float>(0, 0)
+    // padding.x is the independent geometry/compensation strength multiplier.
+    var padding = SIMD2<Float>(1, 0)
 }
 
 final class FrameStore: @unchecked Sendable {
@@ -53,25 +55,26 @@ enum PerspectiveRenderError: LocalizedError {
         case .shaderCompilation(let message): return "Metal shader 编译失败：\(message)"
         case .pipeline(let message): return "Metal pipeline 创建失败：\(message)"
         case .textureCache: return "无法创建 CoreVideo / Metal texture cache。"
-        case .blur(let message): return "Metal 模糊管线失败：\(message)"
+        case .blur(let message): return "高斯模糊管线失败：\(message)"
         }
     }
 }
 
-/// Inverse-perspective rendering anchored to the bottom hinge. The transformed
-/// desktop is surrounded by black. Blur uses a real mip pyramid (like MacDuo)
-/// instead of sparse long-distance taps, so the fold defocus stays continuous.
+/// Inverse-perspective rendering anchored to the bottom hinge.
+/// A full-resolution MPSImageGaussianBlur is generated on the GPU for each new
+/// captured frame, then blended from top to bottom as the lid closes. This avoids
+/// the repeated-edge/ghosting artifacts produced by sparse long-distance taps.
 final class PerspectiveRenderer: NSObject, MTKViewDelegate {
     let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private let pipeline: MTLRenderPipelineState
-    private let downsamplePipeline: MTLComputePipelineState
     private var textureCache: CVMetalTextureCache?
     private let inFlight = DispatchSemaphore(value: 2)
 
-    private var blurPyramid: MTLTexture?
-    private var blurLevels: [MTLTexture] = []
-    private var blurredRevision: UInt64?
+    private var gaussianTexture: MTLTexture?
+    private var gaussianFilter: MPSImageGaussianBlur?
+    private var gaussianSigma: Float = -1
+    private var gaussianRevision: UInt64?
 
     var frames: FrameStore?
     var parameters: () -> PerspectiveUniforms = { PerspectiveUniforms() }
@@ -100,15 +103,6 @@ final class PerspectiveRenderer: NSObject, MTKViewDelegate {
             throw PerspectiveRenderError.pipeline(error.localizedDescription)
         }
 
-        guard let downsample = library.makeFunction(name: "perspectiveDownsample") else {
-            throw PerspectiveRenderError.shaderCompilation("找不到 perspectiveDownsample")
-        }
-        do {
-            downsamplePipeline = try device.makeComputePipelineState(function: downsample)
-        } catch {
-            throw PerspectiveRenderError.pipeline(error.localizedDescription)
-        }
-
         super.init()
         guard CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &textureCache) == kCVReturnSuccess else {
             throw PerspectiveRenderError.textureCache
@@ -129,9 +123,6 @@ final class PerspectiveRenderer: NSObject, MTKViewDelegate {
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
     func draw(in view: MTKView) {
-        // MacDuo places its overlay above the status-window level. Doing the same
-        // here makes the transformed desktop cover the real macOS menu bar instead
-        // of leaving that bar visually fixed above the fold animation.
         if let window = view.window {
             let targetLevel = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.statusWindow)) + 1)
             if window.level != targetLevel { window.level = targetLevel }
@@ -174,12 +165,20 @@ final class PerspectiveRenderer: NSObject, MTKViewDelegate {
         let blurredTexture: MTLTexture
         do {
             if uniforms.amount > 0.00001, uniforms.softness > 0.00001 {
-                blurredTexture = try prepareBlur(command: command, input: texture, revision: revision)
+                // 0...1 blur control maps to a visibly strong 0...64 px Gaussian sigma.
+                // The angle controls where/how much of this blurred frame is mixed in.
+                let sigma = max(0.01, uniforms.softness * 64.0)
+                blurredTexture = try prepareGaussian(
+                    command: command,
+                    input: texture,
+                    revision: revision,
+                    sigma: sigma
+                )
             } else {
                 blurredTexture = texture
             }
         } catch {
-            blurredRevision = nil
+            gaussianRevision = nil
             DispatchQueue.main.async { [weak self] in self?.onFailure?(error.localizedDescription) }
             return
         }
@@ -198,7 +197,7 @@ final class PerspectiveRenderer: NSObject, MTKViewDelegate {
             withExtendedLifetime((retainedPixelBuffer, retainedCVTexture)) {}
             inFlight.signal()
             if buffer.status == .error {
-                self?.blurredRevision = nil
+                self?.gaussianRevision = nil
                 let message = buffer.error?.localizedDescription ?? "Metal rendering failed"
                 DispatchQueue.main.async { self?.onFailure?(message) }
             }
@@ -208,84 +207,55 @@ final class PerspectiveRenderer: NSObject, MTKViewDelegate {
         committed = true
     }
 
-    /// Build a compact Gaussian-like mip pyramid once per captured desktop frame.
-    /// Angle-only changes reuse the same pyramid, which is much cheaper and avoids
-    /// the repeated ghost images caused by sparse large-radius taps.
-    private func prepareBlur(command: MTLCommandBuffer, input: MTLTexture, revision: UInt64) throws -> MTLTexture {
-        if blurPyramid?.width != input.width ||
-            blurPyramid?.height != input.height ||
-            blurPyramid?.pixelFormat != input.pixelFormat {
+    private func prepareGaussian(
+        command: MTLCommandBuffer,
+        input: MTLTexture,
+        revision: UInt64,
+        sigma: Float
+    ) throws -> MTLTexture {
+        let needsTexture = gaussianTexture?.width != input.width ||
+            gaussianTexture?.height != input.height ||
+            gaussianTexture?.pixelFormat != input.pixelFormat
 
+        if needsTexture {
             let descriptor = MTLTextureDescriptor.texture2DDescriptor(
                 pixelFormat: input.pixelFormat,
                 width: input.width,
                 height: input.height,
-                mipmapped: true
+                mipmapped: false
             )
-            descriptor.mipmapLevelCount = min(9, descriptor.mipmapLevelCount)
             descriptor.storageMode = .private
-            descriptor.usage = [.shaderRead, .shaderWrite, .pixelFormatView]
-
+            descriptor.usage = [.shaderRead, .shaderWrite]
             guard let texture = device.makeTexture(descriptor: descriptor) else {
-                throw PerspectiveRenderError.blur("无法创建 blur pyramid")
+                throw PerspectiveRenderError.blur("无法创建高斯模糊纹理")
             }
-
-            var levels: [MTLTexture] = []
-            for level in 0..<texture.mipmapLevelCount {
-                guard let view = texture.makeTextureView(
-                    pixelFormat: texture.pixelFormat,
-                    textureType: .type2D,
-                    levels: level..<(level + 1),
-                    slices: 0..<1
-                ) else {
-                    throw PerspectiveRenderError.blur("无法创建 mip level \(level)")
-                }
-                levels.append(view)
-            }
-
-            blurPyramid = texture
-            blurLevels = levels
-            blurredRevision = nil
+            gaussianTexture = texture
+            gaussianRevision = nil
         }
 
-        if blurredRevision == revision, let pyramid = blurPyramid {
-            return pyramid
+        if gaussianFilter == nil || abs(gaussianSigma - sigma) > 0.01 {
+            let filter = MPSImageGaussianBlur(device: device, sigma: sigma)
+            filter.edgeMode = .clamp
+            gaussianFilter = filter
+            gaussianSigma = sigma
+            gaussianRevision = nil
         }
 
-        guard let pyramid = blurPyramid,
-              let blit = command.makeBlitCommandEncoder() else {
-            throw PerspectiveRenderError.blur("无法创建 blur copy encoder")
+        if gaussianRevision == revision, let gaussianTexture {
+            return gaussianTexture
         }
 
-        blit.copy(
-            from: input,
-            sourceSlice: 0,
-            sourceLevel: 0,
-            sourceOrigin: MTLOrigin(),
-            sourceSize: MTLSize(width: input.width, height: input.height, depth: 1),
-            to: pyramid,
-            destinationSlice: 0,
-            destinationLevel: 0,
-            destinationOrigin: MTLOrigin()
+        guard let gaussianTexture, let gaussianFilter else {
+            throw PerspectiveRenderError.blur("无法初始化 MPSImageGaussianBlur")
+        }
+
+        gaussianFilter.encode(
+            commandBuffer: command,
+            sourceTexture: input,
+            destinationTexture: gaussianTexture
         )
-        blit.endEncoding()
-
-        for level in 1..<blurLevels.count {
-            guard let encoder = command.makeComputeCommandEncoder() else {
-                throw PerspectiveRenderError.blur("无法创建 mip encoder")
-            }
-            encoder.setComputePipelineState(downsamplePipeline)
-            encoder.setTexture(blurLevels[level - 1], index: 0)
-            encoder.setTexture(blurLevels[level], index: 1)
-            encoder.dispatchThreads(
-                MTLSize(width: blurLevels[level].width, height: blurLevels[level].height, depth: 1),
-                threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1)
-            )
-            encoder.endEncoding()
-        }
-
-        blurredRevision = revision
-        return pyramid
+        gaussianRevision = revision
+        return gaussianTexture
     }
 
     private static let shaderSource = #"""
@@ -314,47 +284,10 @@ final class PerspectiveRenderer: NSObject, MTKViewDelegate {
         return out;
     }
 
-    // Same deterministic 3x3 binomial-style downsample strategy used by MacDuo.
-    // Each mip level is a progressively smoother version of the captured desktop.
-    kernel void perspectiveDownsample(
-        texture2d<float, access::sample> source [[texture(0)]],
-        texture2d<float, access::write> target [[texture(1)]],
-        uint2 pixel [[thread_position_in_grid]])
-    {
-        if (pixel.x >= target.get_width() || pixel.y >= target.get_height()) return;
-        constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);
-        float2 uv = (float2(pixel) + 0.5f) / float2(target.get_width(), target.get_height());
-        float2 texel = 1.0f / float2(source.get_width(), source.get_height());
-        const float offset[3] = { -1.2f, 0.0f, 1.2f };
-        const float weight[3] = { 0.3125f, 0.375f, 0.3125f };
-        float4 color = 0.0f;
-        for (uint y = 0; y < 3; y++) {
-            for (uint x = 0; x < 3; x++) {
-                color += source.sample(s, uv + float2(offset[x], offset[y]) * texel) * weight[x] * weight[y];
-            }
-        }
-        target.write(color, pixel);
-    }
-
-    static float3 sampleMipBlur(
-        texture2d<float> desktop,
-        texture2d<float> pyramid,
-        sampler s,
-        float2 uv,
-        float sigmaUV)
-    {
-        if (!(sigmaUV > 0.0f)) return desktop.sample(s, uv).rgb;
-        float sigma = sigmaUV * float(desktop.get_height());
-        // Each 2x level contributes approximately 1.25 source-pixel variance.
-        float lod = 0.5f * log2(1.0f + sigma * sigma * 2.4f);
-        lod = min(lod, float(pyramid.get_num_mip_levels() - 1));
-        return pyramid.sample(s, uv, level(lod)).rgb;
-    }
-
     fragment float4 perspectiveFragment(
         Varying in [[stage_in]],
         texture2d<float> desktop [[texture(0)]],
-        texture2d<float> pyramid [[texture(1)]],
+        texture2d<float> gaussian [[texture(1)]],
         constant Uniforms& u [[buffer(0)]])
     {
         constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);
@@ -364,45 +297,42 @@ final class PerspectiveRenderer: NSObject, MTKViewDelegate {
             return float4(desktop.sample(s, in.uv).rgb, 1.0f);
         }
 
-        // Distance from the physical bottom hinge: 0 at bottom, 1 at top.
-        float height = 1.0f - in.uv.y;
+        float height = 1.0f - in.uv.y; // 0 at hinge, 1 at top
         float perspective = clamp(u.perspective, 0.0f, 1.0f);
-        float softness = clamp(u.softness, 0.0f, 1.0f);
+        float blurStrength = clamp(u.softness, 0.0f, 1.0f);
+        float compensationStrength = clamp(u.padding.x, 0.50f, 3.00f);
 
-        // Keep our inverse-perspective direction: bottom is anchored while the
-        // upper desktop contracts inward as the physical lid closes.
-        float verticalScale = max(0.50f, 1.0f - p * mix(0.12f, 0.34f, perspective));
+        // Geometry strength is independent from lid progress. This allows 150–300%
+        // compensation without accelerating blur/fade timing or clamping at 100%.
+        float g = min(2.6f, p * compensationStrength);
+        float verticalScale = max(0.26f, 1.0f - g * mix(0.10f, 0.31f, perspective));
         float sourceHeight = height / verticalScale;
         float sourceH = clamp(sourceHeight, 0.0f, 1.0f);
-        float taper = p * mix(0.08f, 0.30f, perspective);
-        float horizontalScale = max(0.50f, 1.0f - taper * sourceH);
+        float taper = g * mix(0.07f, 0.28f, perspective);
+        float horizontalScale = max(0.28f, 1.0f - taper * sourceH);
         float sourceX = 0.5f + (in.uv.x - 0.5f) / horizontalScale;
         float2 sourceUV = float2(sourceX, 1.0f - sourceHeight);
 
-        // The blur field starts at the top and advances toward the hinge. The
-        // transition is intentionally broad; mip LOD interpolation keeps it free
-        // of visible bands or duplicated edges.
-        float closeProgress = pow(p, 0.66f);
-        float blurFront = 1.0f - closeProgress;
-        float frontFeather = 0.24f + 0.14f * softness;
-        float frontAmount = smoothstep(
-            blurFront - frontFeather,
-            blurFront + frontFeather,
+        // A broad blur front starts at the top and travels toward the hinge.
+        // The Gaussian kernel itself is full-resolution MPS; this mask only controls
+        // the natural top-to-bottom blend between sharp and Gaussian-blurred frames.
+        float closeProgress = pow(p, 0.58f);
+        float blurFront = mix(0.96f, 0.01f, closeProgress);
+        float feather = 0.19f + 0.18f * blurStrength + 0.05f * closeProgress;
+        float blurField = smoothstep(
+            blurFront - feather,
+            blurFront + feather,
             sourceH
         );
+        float blurPresence = smoothstep(0.006f, 0.105f, p);
+        float blurMix = clamp(blurField * blurPresence, 0.0f, 1.0f);
 
-        // MacDuo-style continuous sigma: stronger toward the top, but the hinge
-        // is never an abrupt sharp/blur boundary. Standard softness stays subtle.
-        float focus = pow(p, 0.70f);
-        float verticalSpread = 0.12f + 0.88f * pow(sourceH, 1.15f);
-        float advancingSpread = mix(0.24f, 1.0f, frontAmount);
-        float sigmaUV = softness * 0.052f * focus * verticalSpread * advancingSpread;
+        float3 sharp = desktop.sample(s, sourceUV).rgb;
+        float3 blurred = gaussian.sample(s, sourceUV).rgb;
+        float3 color = mix(sharp, blurred, blurMix);
 
-        float3 color = sampleMipBlur(desktop, pyramid, s, sourceUV, sigmaUV);
-
-        // Black surround with a soft, blur-aware trapezoid edge. This keeps the
-        // fold silhouette clean without the hard cut-out look.
-        float edge = 0.0035f + 0.012f * softness + 1.25f * sigmaUV;
+        // Keep the transformed desktop surrounded by black and feather its edge.
+        float edge = 0.0035f + 0.012f * blurStrength + 0.003f * p;
         float halfWidth = 0.5f * horizontalScale;
         float horizontalDistance = abs(in.uv.x - 0.5f);
         float insideX = 1.0f - smoothstep(max(0.0f, halfWidth - edge), halfWidth, horizontalDistance);
@@ -413,8 +343,8 @@ final class PerspectiveRenderer: NSObject, MTKViewDelegate {
             mask = 0.0f;
         }
 
-        float shade = 1.0f - clamp(u.dimming, 0.0f, 1.0f) * 0.12f * p * p * sourceH;
-        float disappear = 1.0f - smoothstep(0.90f, 1.0f, p);
+        float shade = 1.0f - clamp(u.dimming, 0.0f, 1.0f) * 0.15f * p * p * sourceH;
+        float disappear = 1.0f - smoothstep(0.92f, 1.0f, p);
         return float4(color * mask * shade * disappear, 1.0f);
     }
     """#
