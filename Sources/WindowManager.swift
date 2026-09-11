@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import CoreFoundation
 import Foundation
 import Darwin
 
@@ -204,10 +205,32 @@ final class DuoWindowManager {
         return value as? Bool
     }
 
-    private func readPosition(_ element: AXUIElement) -> CGPoint? {
+    /// Swift 6 no longer permits a conditional cast from CFTypeRef to AXValue because
+    /// CoreFoundation reference types are bridged as always-castable at compile time.
+    /// Validate the runtime CFTypeID first, then reinterpret the already-validated value.
+    private func axValueAttribute(_ element: AXUIElement, attribute: CFString, expectedType: AXValueType) -> AXValue? {
         var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &value) == .success,
-              let axValue = value as? AXValue else {
+        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success,
+              let value else {
+            return nil
+        }
+        guard CFGetTypeID(value) == AXValueGetTypeID() else {
+            return nil
+        }
+
+        let axValue: AXValue = unsafeBitCast(value, to: AXValue.self)
+        guard AXValueGetType(axValue) == expectedType else {
+            return nil
+        }
+        return axValue
+    }
+
+    private func readPosition(_ element: AXUIElement) -> CGPoint? {
+        guard let axValue = axValueAttribute(
+            element,
+            attribute: kAXPositionAttribute as CFString,
+            expectedType: .cgPoint
+        ) else {
             return nil
         }
         var point = CGPoint.zero
@@ -216,9 +239,11 @@ final class DuoWindowManager {
     }
 
     private func readSize(_ element: AXUIElement) -> CGSize? {
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &value) == .success,
-              let axValue = value as? AXValue else {
+        guard let axValue = axValueAttribute(
+            element,
+            attribute: kAXSizeAttribute as CFString,
+            expectedType: .cgSize
+        ) else {
             return nil
         }
         var size = CGSize.zero
