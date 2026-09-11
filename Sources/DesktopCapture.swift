@@ -14,7 +14,11 @@ final class DesktopCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     private var starting = false
     private var generation = 0
     private var hasFrame = false
-    private var permissionRequestAttemptedThisLaunch = false
+
+    // Keep the exact SCShareableContent result that successfully passed the
+    // permission check. start() consumes it so one Enable action does not call
+    // ScreenCaptureKit's permission-sensitive discovery API twice.
+    private var verifiedContent: SCShareableContent?
 
     var onFailure: ((String) -> Void)?
     var onFirstFrame: (() -> Void)?
@@ -29,32 +33,13 @@ final class DesktopCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         return content
     }
 
-    /// ScreenCaptureKit can itself trigger the system consent UI. Check the
-    /// CoreGraphics TCC state first so an already-known missing permission does
-    /// not cause repeated prompts every time the user clicks Enable.
-    ///
-    /// macOS may require the app process to restart after a newly granted Screen
-    /// Recording permission. Therefore this process requests at most once and,
-    /// after a grant, returns a clear restart instruction instead of immediately
-    /// touching ScreenCaptureKit again.
+    /// Use ScreenCaptureKit itself as the source of truth for authorization.
+    /// Do not gate it with CGPreflightScreenCaptureAccess(): that API can report
+    /// stale/false state while ScreenCaptureKit is already authorized, which can
+    /// send an otherwise working app back into a permission loop.
     @MainActor
     func verifyAccess() async throws {
-        if !CGPreflightScreenCaptureAccess() {
-            if !permissionRequestAttemptedThisLaunch {
-                permissionRequestAttemptedThisLaunch = true
-                let granted = CGRequestScreenCaptureAccess()
-                if granted {
-                    throw CaptureError.message(
-                        "屏幕录制权限已授予。macOS 需要重新启动本应用后才能让 ScreenCaptureKit 使用新权限；请退出 MacBook Duo Screen，再重新双击 Run.command。"
-                    )
-                }
-            }
-
-            throw CaptureError.message(
-                "当前进程尚未取得屏幕录制权限。请在“系统设置 → 隐私与安全性 → 屏幕与系统音频录制”中允许 MacBook Duo Screen，然后退出应用并重新双击 Run.command。本次运行不会再次弹出授权请求。"
-            )
-        }
-
+        verifiedContent = nil
         let content = try await availableContent()
         guard !content.displays.isEmpty else {
             throw CaptureError.message("没有找到可捕获的显示器。")
@@ -62,6 +47,7 @@ final class DesktopCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         guard ownApplication != nil else {
             throw CaptureError.message("无法从屏幕捕获中排除本程序，请重新启动后再试。")
         }
+        verifiedContent = content
     }
 
     @MainActor
@@ -73,13 +59,16 @@ final class DesktopCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         starting = true
         defer { if token == generation { starting = false } }
 
-        // verifyAccess() should have completed before start(). Keep this guard so
-        // the stream path never becomes another implicit permission requester.
-        guard CGPreflightScreenCaptureAccess() else {
-            throw CaptureError.message("屏幕录制权限在启动捕获前不可用，请退出应用并重新打开。")
+        // Reuse the content obtained by verifyAccess() so a single Enable action
+        // performs only one permission-sensitive SCShareableContent discovery.
+        let content: SCShareableContent
+        if let cached = verifiedContent {
+            content = cached
+            verifiedContent = nil
+        } else {
+            content = try await availableContent()
         }
 
-        let content = try await availableContent()
         guard token == generation else { return }
         guard let display = content.displays.first(where: { $0.displayID == displayID }) else {
             throw CaptureError.message("找不到内置显示器的 ScreenCaptureKit 对象。")
@@ -123,6 +112,7 @@ final class DesktopCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     func stop() {
         generation += 1
         starting = false
+        verifiedContent = nil
         let oldStream = stream
         stream = nil
         frames.clear()
