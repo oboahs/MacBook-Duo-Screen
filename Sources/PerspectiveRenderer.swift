@@ -62,8 +62,8 @@ enum PerspectiveRenderError: LocalizedError {
 
 /// Inverse-perspective rendering anchored to the bottom hinge.
 /// A full-resolution MPSImageGaussianBlur is generated on the GPU for each new
-/// captured frame, then blended from top to bottom as the lid closes. This avoids
-/// the repeated-edge/ghosting artifacts produced by sparse long-distance taps.
+/// captured frame. The upper fold edge simultaneously blurs, dissolves and blooms
+/// outward into the black surround as the lid closes.
 final class PerspectiveRenderer: NSObject, MTKViewDelegate {
     let device: MTLDevice
     private let commandQueue: MTLCommandQueue
@@ -312,40 +312,108 @@ final class PerspectiveRenderer: NSObject, MTKViewDelegate {
         float horizontalScale = max(0.28f, 1.0f - taper * sourceH);
         float sourceX = 0.5f + (in.uv.x - 0.5f) / horizontalScale;
         float2 sourceUV = float2(sourceX, 1.0f - sourceHeight);
+        float2 safeUV = clamp(sourceUV, float2(0.0f), float2(1.0f));
 
-        // A broad blur front starts at the top and travels toward the hinge.
-        // The Gaussian kernel itself is full-resolution MPS; this mask only controls
-        // the natural top-to-bottom blend between sharp and Gaussian-blurred frames.
+        // Gaussian blur front: top first, then progressively toward the hinge.
         float closeProgress = pow(p, 0.58f);
         float blurFront = mix(0.96f, 0.01f, closeProgress);
-        float feather = 0.19f + 0.18f * blurStrength + 0.05f * closeProgress;
+        float blurFeather = 0.19f + 0.18f * blurStrength + 0.05f * closeProgress;
         float blurField = smoothstep(
-            blurFront - feather,
-            blurFront + feather,
+            blurFront - blurFeather,
+            blurFront + blurFeather,
             sourceH
         );
         float blurPresence = smoothstep(0.006f, 0.105f, p);
         float blurMix = clamp(blurField * blurPresence, 0.0f, 1.0f);
 
-        float3 sharp = desktop.sample(s, sourceUV).rgb;
-        float3 blurred = gaussian.sample(s, sourceUV).rgb;
+        float3 sharp = desktop.sample(s, safeUV).rgb;
+        float3 blurred = gaussian.sample(s, safeUV).rgb;
         float3 color = mix(sharp, blurred, blurMix);
 
-        // Keep the transformed desktop surrounded by black and feather its edge.
-        float edge = 0.0035f + 0.012f * blurStrength + 0.003f * p;
+        // The upper edge now dissolves at the same time as it blurs. The dissolve
+        // band starts very near the top when the fold begins and travels downward
+        // slowly as the lid closes. A wide smoothstep removes any visible cut line.
+        float dissolveProgress = pow(p, 0.74f);
+        float dissolveFront = mix(0.985f, 0.58f, dissolveProgress);
+        float dissolveFeather = 0.10f + 0.20f * blurStrength + 0.08f * dissolveProgress;
+        float dissolveField = smoothstep(
+            dissolveFront - dissolveFeather,
+            dissolveFront + dissolveFeather,
+            sourceH
+        );
+        float dissolveAmount = dissolveField * blurPresence * clamp(0.14f + 0.94f * dissolveProgress, 0.0f, 1.0f);
+        float topOpacity = 1.0f - dissolveAmount;
+
+        // Core silhouette. Its own edge is broader than before so the transition
+        // starts inside the transformed desktop rather than at a single hard pixel.
+        float coreEdge = 0.006f + 0.018f * blurStrength + 0.006f * p;
         float halfWidth = 0.5f * horizontalScale;
         float horizontalDistance = abs(in.uv.x - 0.5f);
-        float insideX = 1.0f - smoothstep(max(0.0f, halfWidth - edge), halfWidth, horizontalDistance);
-        float insideTop = 1.0f - smoothstep(max(0.0f, verticalScale - edge), verticalScale, height);
-        float mask = insideX * insideTop;
+        float insideX = 1.0f - smoothstep(
+            max(0.0f, halfWidth - coreEdge),
+            halfWidth + coreEdge * 0.20f,
+            horizontalDistance
+        );
+        float insideTop = 1.0f - smoothstep(
+            max(0.0f, verticalScale - coreEdge * 1.8f),
+            verticalScale + coreEdge * 0.15f,
+            height
+        );
 
-        if (sourceHeight > 1.001f || sourceX < -0.001f || sourceX > 1.001f) {
-            mask = 0.0f;
-        }
+        // Soft source validity replaces the previous hard sourceHeight/sourceX
+        // rejection. This is important: the top can fade out instead of snapping.
+        float sourceFeather = 0.012f + 0.030f * blurStrength;
+        float validLeft = smoothstep(-sourceFeather, sourceFeather, sourceX);
+        float validRight = 1.0f - smoothstep(1.0f - sourceFeather, 1.0f + sourceFeather, sourceX);
+        float validTop = 1.0f - smoothstep(1.0f - sourceFeather, 1.0f + sourceFeather, sourceHeight);
+        float coreMask = insideX * insideTop * validLeft * validRight * validTop;
+        float coreAlpha = coreMask * topOpacity;
+
+        // Edge diffusion / bloom. Gaussian pixels are allowed to extend slightly
+        // beyond the geometric trapezoid, especially around the upper edge. The
+        // expansion grows with blur strength and lid closure, then fades smoothly.
+        float diffusionBase = blurPresence
+                            * (0.006f + 0.052f * blurStrength)
+                            * (0.30f + 0.70f * closeProgress);
+        float sideExpansion = diffusionBase * (0.22f + 0.48f * sourceH);
+        float topExpansion = diffusionBase * (1.25f + 0.85f * closeProgress);
+
+        float expandedHalfWidth = halfWidth + sideExpansion;
+        float haloX = 1.0f - smoothstep(
+            max(0.0f, expandedHalfWidth - diffusionBase * 0.45f),
+            expandedHalfWidth + diffusionBase * 0.80f,
+            horizontalDistance
+        );
+        float expandedTop = verticalScale + topExpansion;
+        float haloTop = 1.0f - smoothstep(
+            expandedTop - diffusionBase * 0.55f,
+            expandedTop + diffusionBase * 0.95f,
+            height
+        );
+
+        float haloSourceX = smoothstep(-0.10f, 0.02f, sourceX)
+                          * (1.0f - smoothstep(0.98f, 1.10f, sourceX));
+        float haloSourceTop = 1.0f - smoothstep(1.00f, 1.16f + 0.10f * blurStrength, sourceHeight);
+        float haloMask = haloX * haloTop * haloSourceX * haloSourceTop;
+        float edgeBand = max(0.0f, haloMask - coreMask);
+
+        // The halo is strongest where the top is already blurred/dissolving, then
+        // falls into black. This creates the soft "evaporating" upper edge instead
+        // of a visible border around the warped desktop.
+        float haloEnergy = blurMix
+                         * (0.16f + 0.44f * blurStrength)
+                         * (0.35f + 0.65f * dissolveField);
+        float3 diffusedEdge = blurred * edgeBand * haloEnergy;
 
         float shade = 1.0f - clamp(u.dimming, 0.0f, 1.0f) * 0.15f * p * p * sourceH;
         float disappear = 1.0f - smoothstep(0.92f, 1.0f, p);
-        return float4(color * mask * shade * disappear, 1.0f);
+
+        // The panel stays opaque black on purpose. "Transparency" is visual: the
+        // transformed image loses energy into black, while a faint Gaussian halo
+        // extends beyond the silhouette. Making the NSPanel itself transparent
+        // would reveal the untouched desktop underneath and break the illusion.
+        float3 composed = color * coreAlpha + diffusedEdge;
+        return float4(composed * shade * disappear, 1.0f);
     }
     """#
 }
