@@ -57,8 +57,14 @@ if arguments.contains("--help") || arguments.contains("-h") {
 if arguments.contains("--once") { exit(runOneShot()) }
 if arguments.contains("--watch") { exit(runWatch()) }
 
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.setActivationPolicy(.accessory)
-app.run()
+// AppKit's application/delegate lifecycle is MainActor-isolated under Swift 6.
+// Top-level Swift code is nonisolated, so enter the main actor explicitly before
+// constructing NSApplication/AppDelegate. This mirrors AppKit's runtime model and
+// keeps the CLI-only LAS paths above synchronous and lightweight.
+MainActor.assumeIsolated {
+    let app = NSApplication.shared
+    let delegate = AppDelegate()
+    app.delegate = delegate
+    app.setActivationPolicy(.accessory)
+    app.run()
+}
