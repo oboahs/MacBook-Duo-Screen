@@ -56,9 +56,9 @@ enum PerspectiveRenderError: LocalizedError {
     }
 }
 
-/// Renders the captured desktop through the same core idea used by MacDuo's
-/// default Duo effect: the physical lid supplies the real-world trapezoid while
-/// software expands the desktop around the bottom-center hinge to counter it.
+/// Renders the captured desktop as an inverse-perspective trapezoid anchored to
+/// the bottom-center hinge. As the physical lid closes, the software image gets
+/// progressively smaller toward the top instead of enlarging with the motion.
 final class PerspectiveRenderer: NSObject, MTKViewDelegate {
     let device: MTLDevice
     private let commandQueue: MTLCommandQueue
@@ -206,20 +206,41 @@ final class PerspectiveRenderer: NSObject, MTKViewDelegate {
             return float4(desktop.sample(s, in.uv).rgb, 1.0f);
         }
 
-        // The physical lid already supplies the real-world trapezoid. Expand
-        // around the bottom-centre hinge to counter the perceived shrinkage.
+        // Inverse perspective around the bottom-center hinge. Closing the lid
+        // must make the software image contract toward the upper center, not
+        // enlarge with the physical motion. The bottom edge remains the anchor.
         float height = 1.0f - in.uv.y;
         float perspective = clamp(u.perspective, 0.0f, 1.0f);
-        float expansion = 1.0f + p * (0.12f + mix(0.30f, 0.66f, perspective) * height);
-        float2 uv = float2(
-            0.5f + (in.uv.x - 0.5f) / expansion,
-            1.0f - height / expansion
-        );
 
-        // Intel-friendly five-tap blur. It increases toward the top edge where
-        // physical foreshortening is strongest.
+        // Vertical contraction shortens the rendered desktop from the top while
+        // keeping the hinge edge fixed. Higher perspective values contract more.
+        float verticalScale = max(0.50f, 1.0f - p * mix(0.12f, 0.34f, perspective));
+        float sourceHeight = height / verticalScale;
+
+        // Horizontal taper grows with distance from the hinge, yielding the
+        // trapezoid needed to counter the changing physical viewing angle.
+        float taper = p * mix(0.08f, 0.30f, perspective);
+        float horizontalScale = max(0.50f, 1.0f - taper * clamp(sourceHeight, 0.0f, 1.0f));
+        float sourceX = 0.5f + (in.uv.x - 0.5f) / horizontalScale;
+        float2 uv = float2(sourceX, 1.0f - sourceHeight);
+
+        // Feather only the transformed trapezoid boundary. Outside it we leave
+        // the overlay black instead of clamping and smearing source edge pixels.
         float softness = clamp(u.softness, 0.0f, 1.0f);
-        float radius = softness * p * (0.35f + 2.2f * height);
+        float edge = 0.0015f + 0.010f * softness;
+        float halfWidth = 0.5f * horizontalScale;
+        float horizontalDistance = abs(in.uv.x - 0.5f);
+        float insideX = 1.0f - smoothstep(max(0.0f, halfWidth - edge), halfWidth, horizontalDistance);
+        float insideTop = 1.0f - smoothstep(max(0.0f, verticalScale - edge), verticalScale, height);
+        float mask = insideX * insideTop;
+
+        if (mask <= 0.0001f || sourceHeight > 1.001f || sourceX < -0.001f || sourceX > 1.001f) {
+            return float4(0, 0, 0, 1);
+        }
+
+        // Intel-friendly five-tap blur. Keep it subtle: the primary cue now comes
+        // from geometric inverse perspective rather than zooming the desktop.
+        float radius = softness * p * (0.20f + 1.30f * clamp(sourceHeight, 0.0f, 1.0f));
         float2 texel = 1.0f / float2(desktop.get_width(), desktop.get_height());
         float3 color = desktop.sample(s, uv).rgb * 0.40f;
         color += desktop.sample(s, uv + float2( texel.x * radius, 0)).rgb * 0.15f;
@@ -227,15 +248,7 @@ final class PerspectiveRenderer: NSObject, MTKViewDelegate {
         color += desktop.sample(s, uv + float2(0,  texel.y * radius)).rgb * 0.15f;
         color += desktop.sample(s, uv + float2(0, -texel.y * radius)).rgb * 0.15f;
 
-        float topWidth = p * (0.030f + 0.055f * softness);
-        float sideWidth = p * (0.020f + 0.045f * softness) * u.size.y / max(u.size.x, 1.0f);
-        float bottomWidth = p * (0.004f + 0.010f * softness);
-        float mask = smoothstep(0.0f, topWidth, in.uv.y)
-                   * smoothstep(0.0f, bottomWidth, height)
-                   * smoothstep(0.0f, sideWidth, in.uv.x)
-                   * smoothstep(0.0f, sideWidth, 1.0f - in.uv.x);
-
-        float shade = 1.0f - clamp(u.dimming, 0.0f, 1.0f) * 0.12f * p * p * height;
+        float shade = 1.0f - clamp(u.dimming, 0.0f, 1.0f) * 0.08f * p * p * sourceHeight;
         return float4(color * mask * shade, 1.0f);
     }
     """#
