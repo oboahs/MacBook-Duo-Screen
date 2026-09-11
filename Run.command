@@ -19,7 +19,7 @@ fi
 
 if ! xcode-select -p >/dev/null 2>&1; then
   clear
-  echo "MacBook Duo Screen 首次运行需要 Apple Command Line Tools。"
+  echo "首次运行需要 Apple Command Line Tools。"
   echo "正在打开 Apple 的安装窗口……"
   xcode-select --install >/dev/null 2>&1 || true
   echo
@@ -43,6 +43,12 @@ if [ ! -e "${SOURCE_FILES[0]}" ]; then
   echo "错误：Sources 目录中没有找到 Swift 源码。"
   pause_before_exit
   exit 1
+fi
+
+# Avoid accidentally launching an older in-memory build after pulling new code.
+if pgrep -x MacBookDuoScreen >/dev/null 2>&1; then
+  pkill -x MacBookDuoScreen >/dev/null 2>&1 || true
+  sleep 0.3
 fi
 
 NEED_BUILD=0
@@ -78,15 +84,17 @@ write_plist() {
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.0</string>
+  <string>2.0</string>
   <key>CFBundleVersion</key>
-  <string>1</string>
+  <string>2</string>
   <key>LSUIElement</key>
   <true/>
   <key>LSMultipleInstancesProhibited</key>
   <true/>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>MacBook Duo Screen 需要实时读取内置屏幕画面，用转轴角度做透视补偿。画面只在本机内存中处理，不会保存或上传。</string>
 </dict>
 </plist>
 PLIST_EOF
@@ -97,17 +105,21 @@ write_plist
 if [ "$NEED_BUILD" -eq 1 ]; then
   clear
   echo "=============================================="
-  echo " MacBook Duo Screen 1.0"
+  echo " MacBook Duo Screen 2.0 · Perspective Lock"
   echo "=============================================="
   echo
-  echo "正在编译菜单栏应用……"
+  echo "正在编译 Intel/macOS 原生应用……"
 
   if ! xcrun swiftc -O "${SOURCE_FILES[@]}" \
       -o "$BINARY" \
       -framework AppKit \
-      -framework ApplicationServices \
       -framework IOKit \
-      -framework CoreFoundation; then
+      -framework CoreFoundation \
+      -framework CoreMedia \
+      -framework CoreVideo \
+      -framework ScreenCaptureKit \
+      -framework Metal \
+      -framework MetalKit; then
     echo
     echo "编译失败。请把上面的完整错误信息发出来。"
     pause_before_exit
@@ -132,14 +144,14 @@ fi
 
 open "$APP_DIR"
 STATUS=$?
-
 if [ "$STATUS" -ne 0 ]; then
   echo "启动失败，状态码：$STATUS"
   pause_before_exit
   exit "$STATUS"
 fi
 
-echo "✓ MacBook Duo Screen 已启动。"
-echo "现在可以在 macOS 菜单栏看到实时转轴角度。"
+echo "✓ MacBook Duo Screen 2.0 已启动。"
+echo "请点击菜单栏角度，选择“启用视觉锁定”。"
+echo "首次启用时 macOS 会请求“屏幕录制”权限。"
 echo "这个终端窗口可以直接关闭。"
 exit 0

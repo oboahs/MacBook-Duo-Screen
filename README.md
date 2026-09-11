@@ -1,98 +1,97 @@
 # MacBook Duo Screen
 
-MacBook Duo Screen 是一个利用 MacBook **Lid Angle Sensor（LAS，屏幕转轴角度传感器）**驱动 macOS 窗口布局的菜单栏工具。项目最初用于验证 `MacBookPro16,1`（MacBook Pro 16-inch, 2019）的 LAS；现在 V1 已经把实时角度变成实际交互：合上或打开屏幕可以进入 Duo 双窗口布局、连续改变左右占比，并在退出 Duo 区间时恢复窗口原来的位置。
+MacBook Duo Screen 是一个针对 **MacBookPro16,1（MacBook Pro 16-inch, 2019 / Intel）** 实机开发的转轴视觉实验。它读取 MacBook 的 **Lid Angle Sensor（LAS）**，实时捕获内置屏幕，再根据物理屏幕开合角度对整块桌面做反向透视补偿。
 
-## V1 功能
+目标不是改变窗口大小，而是让屏幕在开合时，桌面内容在观察者眼中尽量像“固定在空间里”：物理面板发生旋转，软件画面围绕底部转轴做相反方向的视觉补偿。
 
-- 原生 Swift + IOKit 读取 LAS，不依赖 Python、Homebrew 或 CMake。
-- Finder 双击 `Run.command` 即可编译并启动 `.app` 菜单栏程序。
-- 菜单栏实时显示当前屏幕角度，例如 `113°`；Duo 布局生效时显示 `D113°`。
-- 30 Hz 采样，并对角度与角速度做平滑，减少转轴轻微抖动。
-- **角度驱动 Duo 布局**：默认触发角度 `≤ 100°`，恢复角度 `≥ 108°`，8° 回差避免临界点反复切换。
-- Duo 进入时自动选择当前最前面的两个可移动应用窗口，并铺到 MacBook 内置屏幕。
-- 可让转轴角度连续控制左右窗口占比：约 `65° → 35/65`，`100° → 65/35`；比例被限制在 30%–70%，避免一侧不可用。
-- 退出 Duo 时恢复这两个窗口进入 Duo 前的位置和尺寸。
-- 可在菜单中手动执行一次 50/50 平铺、恢复窗口、重新连接 LAS、调整触发角度。
-- 窗口移动只在你主动开启 Duo 功能后发生；默认不会擅自重排窗口。
+## V2：Perspective Lock
 
-## 使用
+这一版已经移除 V1 的“双窗口布局”方向，改为和 `duo-fold` / `MacDuo` 相同的视觉思路：
 
-1. Clone 或下载本仓库。
-2. Finder 打开项目目录，双击 **`Run.command`**。
-3. 首次运行如果 macOS 要求 Apple Command Line Tools，安装完成后再次双击。
-4. 编译结束后会启动 **MacBook Duo Screen** 菜单栏应用，菜单栏数字就是实时转轴角度。
-5. 点击菜单栏角度 → 勾选 **“启用角度驱动 Duo 布局”**。
-6. 第一次启用窗口控制时，macOS 会要求“辅助功能”权限。到“系统设置 → 隐私与安全性 → 辅助功能”允许 MacBook Duo Screen；允许后重新点一次 Duo 开关即可。
-7. 准备两个位于最前面的普通应用窗口，将 MacBook 屏幕合到触发角度以下。两个窗口会进入 Duo 布局；继续开合屏幕会改变左右比例。
-8. 把屏幕重新打开到恢复阈值以上，程序会恢复窗口原来的位置。
+- **LAS → 屏幕角度**：继续使用已经在 `MacBookPro16,1` 上验证成功的 Intel HID 读取方式。
+- **ScreenCaptureKit → 实时桌面**：抓取内置屏幕，并显式排除本程序自身，避免递归捕获。
+- **Metal → 全屏反向透视**：用底部中央转轴作为视觉锚点。屏幕向下合时，桌面从转轴处向外扩张，上方内容扩张更强，以抵消物理屏幕的透视缩短。
+- **透明交互逻辑**：覆盖层不拦截鼠标，下面的真实桌面仍然可以操作。
+- **Intel 优化**：默认只捕获 30 fps，并把超高 Retina 输入限制在最大约 2560 px 宽；Metal 显示仍可 60 Hz，降低 2019 Intel MacBook Pro 的 GPU / 功耗压力。
 
-> `Run.command` 只负责本地编译和启动。正常运行时程序在菜单栏后台工作，不需要一直保留终端窗口。
+核心视觉模型参考了开源项目 [DhananjayBhosale/MacDuo](https://github.com/DhananjayBhosale/MacDuo) 的 Duo effect。MacDuo 的关键思路是：**物理 MacBook 屏幕本身已经制造了真实的透视梯形，因此软件不需要再模拟一个 3D 笔记本，而是对桌面做围绕底部铰链的反向扩张。** 本项目保留这个思路，并用已经验证可工作的 Intel LAS 层替换其 Apple-silicon-only 的发布假设。
 
-## 菜单说明
+## 使用方法
 
-菜单中可以看到传感器状态、当前角度、Duo 状态和阈值。主要操作包括：
+1. Clone / 更新仓库。
+2. Finder 中双击 `Run.command`。
+3. 菜单栏会显示实时 LAS 角度，例如 `113°`。
+4. 点击角度，选择 **“启用视觉锁定”**。
+5. 第一次启用时允许 macOS 的 **“屏幕录制”**权限；如系统要求重新打开应用，关闭后重新双击 `Run.command`。
+6. 启用成功时，程序会把**当前屏幕角度自动设为视觉基准**。
+7. 从这个角度慢慢向下合屏幕，桌面内容会开始反向扩张；重新打开回基准角度时，覆盖层自动退出，恢复直接显示真实桌面。
 
-- **启用角度驱动 Duo 布局**：总开关。默认关闭。
-- **用转轴角度控制左右比例**：关闭后 Duo 始终保持 50/50。
-- **触发角度**：可选择 80° / 90° / 100° / 110°，恢复阈值自动设为触发值 + 8°。
-- **立即把最前面的两个窗口设为 50/50**：不需要等角度达到阈值，用来快速测试窗口控制。
-- **恢复窗口原位置**：撤销当前由本程序管理的布局。
-- **辅助功能权限**：查看/打开系统权限设置。
-- **重新连接转轴传感器**：LAS 暂时异常时手动重连。
+> V2 不再需要“辅助功能”权限，因为它不会修改或移动其他应用窗口。
 
-## 双击启动如何工作
+## 菜单
 
-`Run.command` 会在项目目录生成：
+- **启用/关闭视觉锁定**：开始或停止屏幕捕获与视觉补偿。
+- **将当前角度设为视觉基准**：在你当前最舒服的正常屏幕角度校准为 0% 补偿。
+- **补偿强度**：70% / 85% / 100% / 115%。默认 100%。如果看起来画面跟不上物理屏幕，可提高；如果补偿过头，可降低。
+- **透视补偿**：柔和 / 标准 / 强。控制屏幕上部相对底部的非线性扩张幅度。
+- **运动柔化**：降低运动时的锐利抖动。Intel 版使用轻量的五采样 shader，不使用昂贵的多级模糊金字塔。
+- **打开屏幕录制权限设置**：首次授权或权限异常时使用。
+- **重新连接转轴传感器**：LAS 暂时失联时重新探测。
+
+## 双击启动
+
+`Run.command` 会在本项目目录生成：
 
 ```text
 .build/MacBook Duo Screen.app
 ```
 
-它会检查 `Sources/*.swift` 是否比已编译程序更新；只有源码变化时才重新编译，因此日常双击启动不会每次都重新编译。生成的 App 使用固定 Bundle ID：
+源码变化后会自动重新编译。V2 使用的系统框架包括：
 
 ```text
-com.oboahs.MacBookDuoScreen
+AppKit
+IOKit
+ScreenCaptureKit
+CoreMedia / CoreVideo
+Metal / MetalKit
 ```
 
-为了避免普通 Dock 图标，`Info.plist` 使用 `LSUIElement = true`，应用只显示在菜单栏。
+没有 Python、Homebrew、CMake 或第三方运行时依赖。
+
+## Intel 兼容策略
+
+上游 MacDuo README 将正式发行版限定为 Apple Silicon，但其主要技术栈本身是原生 Swift + ScreenCaptureKit + Metal，并没有要求 ARM 指令集才能实现 Duo 效果。本项目没有直接使用其 Apple Silicon 发布二进制，而是：
+
+1. 本机通过 `xcrun swiftc` 直接编译 **x86_64** 可执行文件；
+2. LAS 使用已在 `MacBookPro16,1` 实机验证的 `0x05AC / 0x8104 / UsagePage 0x20 / Usage 0x8A` HID 路径；
+3. 针对 Intel GPU 将桌面捕获默认限制为 30 fps / 最大约 2560 px 宽；
+4. 透视 shader 使用单 pass + 轻量五采样柔化，而不是完整 MacDuo 的五效果、多级模糊体系。
+
+当前首要目标机型：
+
+- `MacBookPro16,1` — MacBook Pro (16-inch, 2019)
+- `MacBookPro16,4` — MacBook Pro (16-inch, 2019)
+
+## 当前限制
+
+这是第一版真正的视觉补偿实现，仍有两个明确限制：
+
+1. **点击坐标尚未做逆映射。** 覆盖层不拦截鼠标，所以底层桌面可以继续点击，但当补偿幅度很大时，你看到的按钮位置和真实点击位置会有偏差。后续可以加入鼠标坐标反变换。
+2. **视觉补偿是观察者模型，不是真实空间追踪。** LAS 只告诉我们屏幕相对底座的夹角，不知道你的眼睛在哪里。默认参数针对正常坐姿设计，因此需要通过“补偿强度 / 透视补偿”做少量主观校准。
 
 ## 命令行诊断
 
-除了正常双击，还保留了底层 LAS 诊断：
+读取一次 LAS：
 
 ```bash
 ./Run.command --once
 ```
 
-读取一次角度；或者：
+持续监测：
 
 ```bash
 ./Run.command --watch
 ```
-
-在终端持续显示角度、方向和角速度。按 `Control + C` 退出。
-
-## 技术实现
-
-LAS 通过 `IOKit.hid` 直接读取：
-
-- Apple Vendor ID: `0x05AC`
-- Product ID: `0x8104`
-- Usage Page: `0x0020`（Sensor）
-- Usage: `0x008A`（Orientation）
-- Feature Report ID: `1`
-
-窗口管理使用 macOS Accessibility API（AXUIElement）。程序从 CoreGraphics 的前台窗口顺序找到最前面的两个应用，再通过 Accessibility API 修改窗口的 `AXPosition` / `AXSize`。因此只有 **Duo 窗口布局**需要辅助功能权限；LAS 角度读取本身不需要这个权限。
-
-## 当前兼容性
-
-本项目首先针对并已经实机验证：
-
-- `MacBookPro16,1` — MacBook Pro (16-inch, 2019)
-
-代码也包含 `MacBookPro16,4` 以及较新的已知 LAS MacBook 型号识别，并会对未知型号直接尝试 HID 探测，但尚未逐台实机验证。
-
-部分应用的窗口可能主动限制最小尺寸、禁止调整尺寸，或者使用非标准窗口实现，因此可能无法完全服从 Duo 布局。这属于 macOS 应用窗口本身的限制。
 
 ## 项目结构
 
@@ -100,32 +99,15 @@ LAS 通过 `IOKit.hid` 直接读取：
 MacBook-Duo-Screen/
 ├── Run.command
 ├── Sources/
-│   ├── main.swift              # CLI / 菜单栏 App 入口
-│   ├── LidAngleSensor.swift    # LAS HID 读取、滤波、机型识别
-│   ├── WindowManager.swift     # Accessibility 窗口捕获、布局、恢复
-│   └── AppDelegate.swift       # 菜单栏、Duo 状态机、设置
-├── .gitignore
-└── THIRD_PARTY_NOTICES.md
+│   ├── main.swift
+│   ├── LidAngleSensor.swift
+│   ├── DesktopCapture.swift
+│   ├── PerspectiveRenderer.swift
+│   └── AppDelegate.swift
+├── THIRD_PARTY_NOTICES.md
+└── README.md
 ```
 
-## Duo 状态机
+## 致谢与许可
 
-默认参数：
-
-```text
-Normal
-  │ angle <= 100°
-  ▼
-Duo ─────── angle >= 108° ──────► Normal
-```
-
-触发与恢复使用不同阈值（hysteresis），因此你把屏幕停在 100° 附近时，不会因为 1–2° 的轻微传感器波动不断进入/退出 Duo。
-
-## 致谢
-
-LAS 的公开逆向资料和设备识别方式参考了：
-
-- Sam Gold — `samhenrigold/LidAngleSensor`
-- Ming — `ufoym/mac-angle`
-
-详细许可信息见 `THIRD_PARTY_NOTICES.md`。
+LAS 逆向资料参考 `samhenrigold/LidAngleSensor` 与 `ufoym/mac-angle`。视觉渲染架构和 Duo effect 的核心思路参考 MIT 许可的 `DhananjayBhosale/MacDuo`。完整第三方许可与归属信息见 `THIRD_PARTY_NOTICES.md`。

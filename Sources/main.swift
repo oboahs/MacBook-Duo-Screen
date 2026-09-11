@@ -4,7 +4,7 @@ import Darwin
 
 func printCLIHelp() {
     print("""
-    MacBook Duo Screen 1.0
+    MacBook Duo Screen 2.0 · Perspective Lock
 
     用法：
       MacBookDuoScreen           启动菜单栏应用
@@ -50,19 +50,12 @@ func runWatch() -> Int32 {
 }
 
 let arguments = Set(CommandLine.arguments.dropFirst())
-
 if arguments.contains("--help") || arguments.contains("-h") {
     printCLIHelp()
     exit(0)
 }
-
-if arguments.contains("--once") {
-    exit(runOneShot())
-}
-
-if arguments.contains("--watch") {
-    exit(runWatch())
-}
+if arguments.contains("--once") { exit(runOneShot()) }
+if arguments.contains("--watch") { exit(runWatch()) }
 
 let app = NSApplication.shared
 let delegate = AppDelegate()

@@ -1,9 +1,17 @@
 import AppKit
+import MetalKit
+import ScreenCaptureKit
 import Foundation
 
+final class PerspectiveOverlayPanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let defaults = UserDefaults.standard
-    private let windowManager = DuoWindowManager()
+    private let capture = DesktopCapture()
     private let filter = LidMotionFilter()
 
     private var sensor: LidAngleSensor?
@@ -12,52 +20,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var statusMenu: NSMenu!
 
+    private var renderer: PerspectiveRenderer?
+    private var panel: PerspectiveOverlayPanel?
+    private var metalView: MTKView?
+    private var builtInDisplayID: CGDirectDisplayID?
+
     private var latestSample = LidMotionSample(angle: 0, velocity: 0)
-    private var duoTriggered = false
-    private var manualLayout = false
-    private var lastLayoutUpdate: TimeInterval = 0
-    private var lastLayoutDescription = ""
+    private var enabled = false
+    private var captureReady = false
+    private var overlayVisible = false
+    private var startingCapture = false
+    private var statusMessage = "待机"
 
-    private let duoEnabledKey = "duoEnabled"
-    private let dynamicSplitKey = "dynamicSplit"
-    private let enterAngleKey = "enterAngle"
-    private let exitAngleKey = "exitAngle"
-    private let welcomeShownKey = "welcomeShownV1"
+    private let referenceKey = "perspectiveReferenceAngle"
+    private let strengthKey = "perspectiveStrength"
+    private let softnessKey = "perspectiveSoftness"
+    private let perspectiveKey = "perspectiveDepth"
+    private let welcomeKey = "welcomeShownV2"
 
-    private var duoEnabled: Bool {
-        get { defaults.bool(forKey: duoEnabledKey) }
-        set { defaults.set(newValue, forKey: duoEnabledKey) }
-    }
-
-    private var dynamicSplit: Bool {
-        get { defaults.object(forKey: dynamicSplitKey) == nil ? true : defaults.bool(forKey: dynamicSplitKey) }
-        set { defaults.set(newValue, forKey: dynamicSplitKey) }
-    }
-
-    private var enterAngle: Double {
+    private var referenceAngle: Double {
         get {
-            let value = defaults.double(forKey: enterAngleKey)
-            return value == 0 ? 100 : value
+            let saved = defaults.double(forKey: referenceKey)
+            return saved > 5 ? saved : 110
         }
-        set { defaults.set(newValue, forKey: enterAngleKey) }
+        set { defaults.set(newValue, forKey: referenceKey) }
     }
 
-    private var exitAngle: Double {
+    private var strength: Double {
         get {
-            let value = defaults.double(forKey: exitAngleKey)
-            return value == 0 ? 108 : value
+            let saved = defaults.double(forKey: strengthKey)
+            return saved > 0 ? saved : 1.0
         }
-        set { defaults.set(newValue, forKey: exitAngleKey) }
+        set { defaults.set(newValue, forKey: strengthKey) }
+    }
+
+    private var softness: Double {
+        get {
+            if defaults.object(forKey: softnessKey) == nil { return 0.25 }
+            return defaults.double(forKey: softnessKey)
+        }
+        set { defaults.set(newValue, forKey: softnessKey) }
+    }
+
+    private var perspectiveDepth: Double {
+        get {
+            if defaults.object(forKey: perspectiveKey) == nil { return 0.75 }
+            return defaults.double(forKey: perspectiveKey)
+        }
+        set { defaults.set(newValue, forKey: perspectiveKey) }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         setupStatusItem()
+        setupCaptureCallbacks()
         connectSensor()
         startPolling()
 
-        if !defaults.bool(forKey: welcomeShownKey) {
-            defaults.set(true, forKey: welcomeShownKey)
+        if !defaults.bool(forKey: welcomeKey) {
+            defaults.set(true, forKey: welcomeKey)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
                 self?.showWelcome()
             }
@@ -66,18 +87,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         timer?.invalidate()
-        windowManager.restore()
+        capture.stop()
+        hideOverlay()
+        panel?.close()
     }
 
     private func setupStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = "LAS …"
-        statusItem.button?.toolTip = "MacBook Duo Screen"
+        statusItem.button?.toolTip = "MacBook Duo Screen · Perspective Lock"
 
         statusMenu = NSMenu(title: "MacBook Duo Screen")
         statusMenu.delegate = self
         statusItem.menu = statusMenu
         rebuildMenu()
+    }
+
+    private func setupCaptureCallbacks() {
+        capture.onFirstFrame = { [weak self] in
+            guard let self, self.enabled else { return }
+            self.captureReady = true
+            self.statusMessage = "桌面捕获已连接"
+            self.updateOverlayVisibility()
+            self.rebuildMenu()
+        }
+        capture.onUnavailable = { [weak self] in
+            guard let self else { return }
+            self.captureReady = false
+            self.hideOverlay()
+            self.statusMessage = "桌面画面暂不可用"
+            self.rebuildMenu()
+        }
+        capture.onFailure = { [weak self] reason in
+            guard let self else { return }
+            self.captureReady = false
+            self.enabled = false
+            self.hideOverlay()
+            self.statusMessage = "捕获中断：\(reason)"
+            self.rebuildMenu()
+        }
     }
 
     private func connectSensor() {
@@ -87,6 +135,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             filter.reset()
             let raw = try sensor?.readAngle() ?? 0
             latestSample = filter.update(rawAngle: raw)
+            if defaults.object(forKey: referenceKey) == nil {
+                referenceAngle = latestSample.angle
+            }
             updateStatusTitle()
         } catch {
             sensor = nil
@@ -98,91 +149,202 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func startPolling() {
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
-            self?.pollSensor()
+            MainActor.assumeIsolated { self?.pollSensor() }
         }
-        RunLoop.main.add(timer!, forMode: .common)
+        if let timer { RunLoop.main.add(timer, forMode: .common) }
     }
 
     private func pollSensor() {
-        guard let sensor = sensor else { return }
-
+        guard let sensor else { return }
         do {
-            let raw = try sensor.readAngle()
-            latestSample = filter.update(rawAngle: raw)
+            latestSample = filter.update(rawAngle: try sensor.readAngle())
             updateStatusTitle()
-            evaluateDuoState()
+            if enabled {
+                updateOverlayVisibility()
+            }
         } catch {
             sensorError = error.localizedDescription
             self.sensor = nil
             statusItem.button?.title = "LAS !"
-            if duoTriggered {
-                exitDuo(reason: "传感器中断")
-            }
+            disableEffect(message: "转轴传感器中断")
+        }
+    }
+
+    private func compensationAmount() -> Double {
+        // Same easing family as MacDuo's Duo effect, but the reference angle is
+        // calibrated from the user's current working position instead of fixed.
+        let clear = min(150.0, max(60.0, referenceAngle))
+        guard clear > 6 else { return 0 }
+        let t = min(1.0, max(0.0, (clear - latestSample.angle) / (clear - 5.0)))
+        let eased = t * t * (3.0 - 2.0 * t)
+        return min(1.0, max(0.0, eased * strength))
+    }
+
+    private func updateOverlayVisibility() {
+        guard enabled, captureReady else {
+            hideOverlay()
+            return
+        }
+
+        let amount = compensationAmount()
+        if amount > 0.0005 {
+            showOverlay()
+        } else {
+            hideOverlay()
         }
     }
 
     private func updateStatusTitle() {
         let angle = Int(round(latestSample.angle))
-        let marker = duoTriggered || manualLayout ? "D" : ""
-        statusItem.button?.title = "\(marker)\(angle)°"
-        statusItem.button?.toolTip = "MacBook Duo Screen · \(String(format: "%.1f", latestSample.angle))° · \(latestSample.directionText)"
+        let prefix = enabled ? "P" : ""
+        statusItem.button?.title = "\(prefix)\(angle)°"
+        statusItem.button?.toolTip = "当前 \(String(format: "%.1f", latestSample.angle))° · 基准 \(String(format: "%.1f", referenceAngle))° · \(latestSample.directionText)"
     }
 
-    private func evaluateDuoState() {
-        guard duoEnabled, !manualLayout else { return }
+    private func builtInScreen() -> NSScreen? {
+        NSScreen.screens.first { screen in
+            guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return false }
+            let id = CGDirectDisplayID(number.uint32Value)
+            return CGDisplayIsBuiltin(id) != 0 && CGDisplayIsActive(id) != 0
+        }
+    }
 
-        if !duoTriggered && latestSample.angle <= enterAngle {
-            enterDuo()
+    private func prepareOverlay() throws -> (screen: NSScreen, displayID: CGDirectDisplayID) {
+        guard let screen = builtInScreen(),
+              let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+            throw CaptureError.message("没有找到可用的 MacBook 内置屏幕。")
+        }
+        let displayID = CGDirectDisplayID(number.uint32Value)
+
+        if panel != nil && (builtInDisplayID != displayID || panel?.frame != screen.frame) {
+            hideOverlay()
+            panel?.close()
+            panel = nil
+            metalView = nil
+            renderer = nil
+        }
+        builtInDisplayID = displayID
+
+        if panel == nil {
+            let renderer = try PerspectiveRenderer()
+            renderer.frames = capture.frames
+            renderer.parameters = { [weak self] in
+                guard let self else { return PerspectiveUniforms() }
+                return PerspectiveUniforms(
+                    amount: Float(self.compensationAmount()),
+                    perspective: Float(self.perspectiveDepth),
+                    softness: Float(self.softness),
+                    dimming: 0.15,
+                    size: SIMD2<Float>(1, 1),
+                    padding: SIMD2<Float>(0, 0)
+                )
+            }
+            renderer.onFailure = { [weak self] reason in
+                self?.disableEffect(message: "Metal 渲染失败：\(reason)")
+            }
+
+            let panel = PerspectiveOverlayPanel(
+                contentRect: screen.frame,
+                styleMask: [.borderless, .nonactivatingPanel],
+                backing: .buffered,
+                defer: false,
+                screen: screen
+            )
+            panel.level = .floating
+            panel.isOpaque = true
+            panel.backgroundColor = .black
+            panel.hasShadow = false
+            panel.ignoresMouseEvents = true
+            panel.hidesOnDeactivate = false
+            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+            panel.isReleasedWhenClosed = false
+            panel.sharingType = .none
+            panel.setFrame(screen.frame, display: false)
+
+            let view = MTKView(frame: NSRect(origin: .zero, size: screen.frame.size), device: renderer.device)
+            view.autoresizingMask = [.width, .height]
+            view.frame = panel.contentView?.bounds ?? NSRect(origin: .zero, size: screen.frame.size)
+            renderer.configure(view, fps: 60)
+            panel.contentView = view
+
+            self.renderer = renderer
+            self.panel = panel
+            self.metalView = view
+        }
+
+        return (screen, displayID)
+    }
+
+    private func showOverlay() {
+        guard !overlayVisible, let panel else { return }
+        panel.orderFrontRegardless()
+        overlayVisible = true
+    }
+
+    private func hideOverlay() {
+        guard overlayVisible else { return }
+        panel?.orderOut(nil)
+        overlayVisible = false
+    }
+
+    private func enableEffect() {
+        guard !enabled, !startingCapture else { return }
+        guard sensor != nil else {
+            statusMessage = "转轴传感器不可用"
+            rebuildMenu()
             return
         }
 
-        if duoTriggered && latestSample.angle >= exitAngle {
-            exitDuo(reason: "屏幕已打开")
-            return
-        }
+        referenceAngle = latestSample.angle
+        startingCapture = true
+        statusMessage = "正在请求屏幕录制权限…"
+        rebuildMenu()
 
-        if duoTriggered && dynamicSplit {
-            let now = ProcessInfo.processInfo.systemUptime
-            if now - lastLayoutUpdate >= 0.10 {
-                windowManager.updateDuo(ratio: ratio(for: latestSample.angle))
-                lastLayoutUpdate = now
+        Task { [weak self] in
+            guard let self else { return }
+            defer {
+                self.startingCapture = false
+                self.rebuildMenu()
+            }
+            do {
+                let prepared = try self.prepareOverlay()
+                try await self.capture.verifyAccess()
+
+                // Intel machines prefer a 30 fps capture stream. Metal still
+                // presents at 60 Hz so angle animation stays responsive.
+                let scale = prepared.screen.backingScaleFactor
+                let nativeWidth = Int(prepared.screen.frame.width * scale)
+                let nativeHeight = Int(prepared.screen.frame.height * scale)
+                let maxWidth = 2560
+                let captureScale = min(1.0, Double(maxWidth) / Double(max(nativeWidth, 1)))
+                let width = Int(Double(nativeWidth) * captureScale)
+                let height = Int(Double(nativeHeight) * captureScale)
+
+                try await self.capture.start(
+                    displayID: prepared.displayID,
+                    width: width,
+                    height: height,
+                    fps: 30
+                )
+                self.enabled = true
+                self.statusMessage = "视觉锁定已启用"
+                self.updateStatusTitle()
+            } catch {
+                self.enabled = false
+                self.captureReady = false
+                self.hideOverlay()
+                self.statusMessage = "无法启用：\(error.localizedDescription)"
             }
         }
     }
 
-    private func enterDuo() {
-        guard !duoTriggered else { return }
-
-        if !windowManager.isAccessibilityTrusted() {
-            _ = windowManager.requestAccessibilityPermission()
-            lastLayoutDescription = "需要在系统设置中允许辅助功能权限"
-            return
-        }
-
-        let split = dynamicSplit ? ratio(for: latestSample.angle) : 0.5
-        guard let result = windowManager.beginDuo(ratio: split) else {
-            lastLayoutDescription = "没有找到两个可移动窗口"
-            return
-        }
-
-        duoTriggered = true
-        lastLayoutUpdate = ProcessInfo.processInfo.systemUptime
-        lastLayoutDescription = "\(result.leftApp) + \(result.rightApp)"
+    private func disableEffect(message: String = "视觉锁定已关闭") {
+        enabled = false
+        captureReady = false
+        hideOverlay()
+        capture.stop()
+        statusMessage = message
         updateStatusTitle()
-    }
-
-    private func exitDuo(reason: String) {
-        windowManager.restore()
-        duoTriggered = false
-        manualLayout = false
-        lastLayoutDescription = reason
-        updateStatusTitle()
-    }
-
-    private func ratio(for angle: Double) -> CGFloat {
-        let normalized = (angle - 65.0) / 35.0
-        let clamped = min(max(normalized, 0.0), 1.0)
-        return CGFloat(0.35 + clamped * 0.30)
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -192,83 +354,90 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func rebuildMenu() {
         statusMenu.removeAllItems()
 
-        let sensorLine: String
-        if let error = sensorError {
-            sensorLine = "传感器：异常 · \(error)"
+        if let sensorError {
+            addDisabledItem("LAS：异常 · \(sensorError)")
         } else if sensor != nil {
-            sensorLine = "传感器：已连接 · \(String(format: "%.1f", latestSample.angle))° · \(latestSample.directionText)"
+            addDisabledItem("LAS：\(String(format: "%.1f", latestSample.angle))° · \(latestSample.directionText)")
         } else {
-            sensorLine = "传感器：正在等待"
+            addDisabledItem("LAS：未连接")
         }
-        addDisabledItem(sensorLine)
-
-        let modeText: String
-        if manualLayout {
-            modeText = "布局：手动 Duo"
-        } else if duoTriggered {
-            modeText = "布局：Duo 已触发 · \(lastLayoutDescription)"
-        } else if duoEnabled {
-            modeText = "布局：自动待机（≤ \(Int(enterAngle))° 触发）"
-        } else {
-            modeText = "布局：关闭"
-        }
-        addDisabledItem(modeText)
-        addDisabledItem("恢复阈值：≥ \(Int(exitAngle))°")
+        addDisabledItem("视觉基准：\(String(format: "%.1f", referenceAngle))°")
+        addDisabledItem("补偿量：\(Int(round(compensationAmount() * 100)))%")
+        addDisabledItem("状态：\(statusMessage)")
         statusMenu.addItem(.separator())
 
-        let enableItem = NSMenuItem(title: "启用角度驱动 Duo 布局", action: #selector(toggleDuoEnabled(_:)), keyEquivalent: "")
-        enableItem.target = self
-        enableItem.state = duoEnabled ? .on : .off
-        statusMenu.addItem(enableItem)
+        let toggle = NSMenuItem(
+            title: enabled ? "关闭视觉锁定" : (startingCapture ? "正在启用…" : "启用视觉锁定"),
+            action: #selector(toggleEffect(_:)),
+            keyEquivalent: ""
+        )
+        toggle.target = self
+        toggle.isEnabled = !startingCapture
+        toggle.state = enabled ? .on : .off
+        statusMenu.addItem(toggle)
 
-        let dynamicItem = NSMenuItem(title: "用转轴角度控制左右比例", action: #selector(toggleDynamicSplit(_:)), keyEquivalent: "")
-        dynamicItem.target = self
-        dynamicItem.state = dynamicSplit ? .on : .off
-        statusMenu.addItem(dynamicItem)
+        let calibrate = NSMenuItem(title: "将当前角度设为视觉基准", action: #selector(calibrate(_:)), keyEquivalent: "")
+        calibrate.target = self
+        calibrate.isEnabled = sensor != nil
+        statusMenu.addItem(calibrate)
 
-        let thresholdItem = NSMenuItem(title: "触发角度", action: nil, keyEquivalent: "")
-        let thresholdMenu = NSMenu(title: "触发角度")
-        for value in [80, 90, 100, 110] {
-            let item = NSMenuItem(title: "\(value)°", action: #selector(selectThreshold(_:)), keyEquivalent: "")
+        let strengthItem = NSMenuItem(title: "补偿强度", action: nil, keyEquivalent: "")
+        let strengthMenu = NSMenu(title: "补偿强度")
+        for (label, value, tag) in [("70%", 0.7, 70), ("85%", 0.85, 85), ("100%", 1.0, 100), ("115%", 1.15, 115)] {
+            let item = NSMenuItem(title: label, action: #selector(selectStrength(_:)), keyEquivalent: "")
             item.target = self
-            item.tag = value
-            item.state = Int(enterAngle) == value ? .on : .off
-            thresholdMenu.addItem(item)
+            item.tag = tag
+            item.representedObject = value
+            item.state = abs(strength - value) < 0.001 ? .on : .off
+            strengthMenu.addItem(item)
         }
-        thresholdItem.submenu = thresholdMenu
-        statusMenu.addItem(thresholdItem)
+        strengthItem.submenu = strengthMenu
+        statusMenu.addItem(strengthItem)
+
+        let perspectiveItem = NSMenuItem(title: "透视补偿", action: nil, keyEquivalent: "")
+        let perspectiveMenu = NSMenu(title: "透视补偿")
+        for (label, value, tag) in [("柔和", 0.45, 45), ("标准", 0.75, 75), ("强", 1.0, 100)] {
+            let item = NSMenuItem(title: label, action: #selector(selectPerspective(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = tag
+            item.representedObject = value
+            item.state = abs(perspectiveDepth - value) < 0.001 ? .on : .off
+            perspectiveMenu.addItem(item)
+        }
+        perspectiveItem.submenu = perspectiveMenu
+        statusMenu.addItem(perspectiveItem)
+
+        let softnessItem = NSMenuItem(title: "运动柔化", action: nil, keyEquivalent: "")
+        let softnessMenu = NSMenu(title: "运动柔化")
+        for (label, value, tag) in [("关闭", 0.0, 0), ("低", 0.15, 15), ("标准", 0.25, 25), ("高", 0.45, 45)] {
+            let item = NSMenuItem(title: label, action: #selector(selectSoftness(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = tag
+            item.representedObject = value
+            item.state = abs(softness - value) < 0.001 ? .on : .off
+            softnessMenu.addItem(item)
+        }
+        softnessItem.submenu = softnessMenu
+        statusMenu.addItem(softnessItem)
 
         statusMenu.addItem(.separator())
 
-        let forceItem = NSMenuItem(title: "立即把最前面的两个窗口设为 50/50", action: #selector(forceDuo(_:)), keyEquivalent: "")
-        forceItem.target = self
-        statusMenu.addItem(forceItem)
+        let privacy = NSMenuItem(title: "打开屏幕录制权限设置…", action: #selector(openScreenRecording(_:)), keyEquivalent: "")
+        privacy.target = self
+        statusMenu.addItem(privacy)
 
-        let restoreItem = NSMenuItem(title: "恢复窗口原位置", action: #selector(restoreWindows(_:)), keyEquivalent: "")
-        restoreItem.target = self
-        restoreItem.isEnabled = windowManager.isManagingWindows
-        statusMenu.addItem(restoreItem)
-
-        statusMenu.addItem(.separator())
-
-        let permissionTitle = windowManager.isAccessibilityTrusted() ? "辅助功能权限：已允许" : "辅助功能权限：需要允许…"
-        let permissionItem = NSMenuItem(title: permissionTitle, action: #selector(openAccessibility(_:)), keyEquivalent: "")
-        permissionItem.target = self
-        statusMenu.addItem(permissionItem)
-
-        let reconnectItem = NSMenuItem(title: "重新连接转轴传感器", action: #selector(reconnectSensor(_:)), keyEquivalent: "")
-        reconnectItem.target = self
-        statusMenu.addItem(reconnectItem)
+        let reconnect = NSMenuItem(title: "重新连接转轴传感器", action: #selector(reconnectSensor(_:)), keyEquivalent: "")
+        reconnect.target = self
+        statusMenu.addItem(reconnect)
 
         statusMenu.addItem(.separator())
+        let about = NSMenuItem(title: "关于 / 使用说明", action: #selector(showAbout(_:)), keyEquivalent: "")
+        about.target = self
+        statusMenu.addItem(about)
 
-        let aboutItem = NSMenuItem(title: "关于 MacBook Duo Screen", action: #selector(showAbout(_:)), keyEquivalent: "")
-        aboutItem.target = self
-        statusMenu.addItem(aboutItem)
-
-        let quitItem = NSMenuItem(title: "退出", action: #selector(quit(_:)), keyEquivalent: "q")
-        quitItem.target = self
-        statusMenu.addItem(quitItem)
+        let quit = NSMenuItem(title: "退出", action: #selector(quit(_:)), keyEquivalent: "q")
+        quit.target = self
+        statusMenu.addItem(quit)
     }
 
     private func addDisabledItem(_ title: String) {
@@ -277,71 +446,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusMenu.addItem(item)
     }
 
-    @objc private func toggleDuoEnabled(_ sender: NSMenuItem) {
-        duoEnabled.toggle()
-        if !duoEnabled {
-            exitDuo(reason: "Duo 已关闭")
-        } else if !windowManager.isAccessibilityTrusted() {
-            _ = windowManager.requestAccessibilityPermission()
-        } else {
-            evaluateDuoState()
-        }
+    @objc private func toggleEffect(_ sender: NSMenuItem) {
+        if enabled { disableEffect() } else { enableEffect() }
         rebuildMenu()
     }
 
-    @objc private func toggleDynamicSplit(_ sender: NSMenuItem) {
-        dynamicSplit.toggle()
-        if duoTriggered && windowManager.isManagingWindows {
-            let split = dynamicSplit ? ratio(for: latestSample.angle) : 0.5
-            windowManager.updateDuo(ratio: split)
-        }
-        rebuildMenu()
-    }
-
-    @objc private func selectThreshold(_ sender: NSMenuItem) {
-        enterAngle = Double(sender.tag)
-        exitAngle = Double(sender.tag + 8)
-        if duoTriggered && latestSample.angle >= exitAngle {
-            exitDuo(reason: "阈值已调整")
-        } else {
-            evaluateDuoState()
-        }
-        rebuildMenu()
-    }
-
-    @objc private func forceDuo(_ sender: NSMenuItem) {
-        if !windowManager.isAccessibilityTrusted() {
-            _ = windowManager.requestAccessibilityPermission()
-            lastLayoutDescription = "请允许辅助功能权限后再点一次"
-            rebuildMenu()
-            return
-        }
-
-        if windowManager.isManagingWindows {
-            windowManager.restore()
-        }
-        guard let result = windowManager.beginDuo(ratio: 0.5) else {
-            lastLayoutDescription = "没有找到两个可移动窗口"
-            rebuildMenu()
-            return
-        }
-        manualLayout = true
-        duoTriggered = false
-        lastLayoutDescription = "\(result.leftApp) + \(result.rightApp)"
+    @objc private func calibrate(_ sender: NSMenuItem) {
+        referenceAngle = latestSample.angle
+        statusMessage = "已将 \(String(format: "%.1f", referenceAngle))° 设为视觉基准"
+        updateOverlayVisibility()
         updateStatusTitle()
         rebuildMenu()
     }
 
-    @objc private func restoreWindows(_ sender: NSMenuItem) {
-        exitDuo(reason: "已手动恢复")
+    @objc private func selectStrength(_ sender: NSMenuItem) {
+        if let value = sender.representedObject as? Double { strength = value }
         rebuildMenu()
     }
 
-    @objc private func openAccessibility(_ sender: NSMenuItem) {
-        if !windowManager.isAccessibilityTrusted() {
-            _ = windowManager.requestAccessibilityPermission()
+    @objc private func selectPerspective(_ sender: NSMenuItem) {
+        if let value = sender.representedObject as? Double { perspectiveDepth = value }
+        rebuildMenu()
+    }
+
+    @objc private func selectSoftness(_ sender: NSMenuItem) {
+        if let value = sender.representedObject as? Double { softness = value }
+        rebuildMenu()
+    }
+
+    @objc private func openScreenRecording(_ sender: NSMenuItem) {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(url)
         }
-        windowManager.openAccessibilitySettings()
     }
 
     @objc private func reconnectSensor(_ sender: NSMenuItem) {
@@ -350,10 +486,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func showAbout(_ sender: NSMenuItem) {
-        let model = currentMacModel()
         let alert = NSAlert()
-        alert.messageText = "MacBook Duo Screen 1.0"
-        alert.informativeText = "用 MacBook 的转轴角度驱动窗口布局。\n\n当前机器：\(model)\n传感器：\(sensor == nil ? "未连接" : "已连接")\n当前角度：\(String(format: "%.1f", latestSample.angle))°"
+        alert.messageText = "MacBook Duo Screen · Perspective Lock"
+        alert.informativeText = "当前版本不再修改窗口布局。它实时捕获内置屏幕，并根据 LAS 转轴角度对整块桌面做反向透视补偿，让屏幕开合时内容在视觉上更像固定在空间中。\n\n第一次启用需要允许“屏幕录制”。覆盖层不会拦截鼠标，但在大角度补偿时，视觉位置与真实点击位置暂时不会完全一致。"
         alert.addButton(withTitle: "好")
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
@@ -365,8 +500,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func showWelcome() {
         let alert = NSAlert()
-        alert.messageText = "MacBook Duo Screen 已启动"
-        alert.informativeText = "转轴传感器已经进入后台监测，菜单栏会实时显示角度。\n\nDuo 布局默认关闭。开启后，屏幕合到 \(Int(enterAngle))° 以下时，程序会把最前面的两个应用窗口铺到内置屏幕；继续开合屏幕可以改变左右比例，重新打开到 \(Int(exitAngle))° 以上会自动恢复窗口原位置。"
+        alert.messageText = "Perspective Lock 已就绪"
+        alert.informativeText = "这版已经改成你需要的方向：不会再调整两个窗口。\n\n点击菜单栏角度 →“启用视觉锁定”。程序会把启用时的屏幕角度作为视觉基准；之后向下合屏时，桌面内容会围绕底部转轴做反向透视补偿。第一次启用需要授予屏幕录制权限。"
         alert.addButton(withTitle: "知道了")
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
