@@ -49,7 +49,6 @@ if [ ! -e "${SOURCE_FILES[0]}" ]; then
   exit 1
 fi
 
-# Avoid accidentally launching an older in-memory build after pulling new code.
 if pgrep -x MacBookDuoScreen >/dev/null 2>&1; then
   pkill -x MacBookDuoScreen >/dev/null 2>&1 || true
   sleep 0.3
@@ -171,8 +170,6 @@ reset_stale_screen_capture_permission_if_needed() {
   local signing_mode
   signing_mode="$(cat "$SIGNING_MODE_FILE" 2>/dev/null || true)"
 
-  # A stable Apple signing identity can survive rebuilds, so it doesn't need the
-  # development-only TCC reset below.
   if [[ "$signing_mode" != adhoc* ]]; then
     return 0
   fi
@@ -202,10 +199,6 @@ reset_stale_screen_capture_permission_if_needed() {
   fi
 }
 
-# IMPORTANT: Never rewrite files inside a signed .app unless their contents
-# actually changed. TCC identifies privacy-sensitive apps using their signed code
-# identity. Rewriting Info.plist after signing breaks the bundle's resource seal
-# even when the text written is identical.
 render_plist > "$PLIST_EXPECTED"
 PLIST_CHANGED=0
 if [ ! -f "$PLIST" ] || ! cmp -s "$PLIST_EXPECTED" "$PLIST"; then
@@ -234,7 +227,8 @@ if [ "$NEED_BUILD" -eq 1 ]; then
       -framework CoreVideo \
       -framework ScreenCaptureKit \
       -framework Metal \
-      -framework MetalKit; then
+      -framework MetalKit \
+      -framework MetalPerformanceShaders; then
     echo
     echo "编译失败。请把上面的完整错误信息发出来。"
     pause_before_exit
@@ -246,13 +240,11 @@ if [ "$NEED_BUILD" -eq 1 ]; then
   NEED_SIGN=1
 fi
 
-# Repair an invalid signature once, then keep the bundle byte-for-byte stable.
 if [ -x "$BINARY" ] && ! codesign --verify --deep --strict "$APP_DIR" >/dev/null 2>&1; then
   echo "检测到 App 签名失效，正在修复……"
   NEED_SIGN=1
 fi
 
-# If a stable identity becomes available later, upgrade without rebuilding.
 STABLE_IDENTITY="$(find_stable_signing_identity)"
 CURRENT_SIGNING_MODE="$(cat "$SIGNING_MODE_FILE" 2>/dev/null || true)"
 if [ -n "$STABLE_IDENTITY" ] && [ "$CURRENT_SIGNING_MODE" != "stable:$STABLE_IDENTITY" ]; then
@@ -272,10 +264,6 @@ if [ "$NEED_SIGN" -eq 1 ]; then
   fi
 fi
 
-# Ad-hoc builds receive a new code identity after each rebuild. System Settings
-# can keep showing the old entry as enabled even though it no longer matches the
-# current binary. Reset only when the actual code identity changes, never on every
-# launch of the same build.
 reset_stale_screen_capture_permission_if_needed
 
 if [ "$#" -gt 0 ]; then
