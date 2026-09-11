@@ -56,9 +56,9 @@ enum PerspectiveRenderError: LocalizedError {
     }
 }
 
-/// Inverse-perspective rendering anchored to the bottom hinge. The foreground
-/// desktop contracts into a trapezoid while a vertically advancing blur field
-/// replaces the old black surround and gradually covers the whole display.
+/// Inverse-perspective rendering anchored to the bottom hinge. The transformed
+/// desktop remains surrounded by black while a broad, angle-driven blur field
+/// advances naturally from the top toward the hinge as the lid closes.
 final class PerspectiveRenderer: NSObject, MTKViewDelegate {
     let device: MTLDevice
     private let commandQueue: MTLCommandQueue
@@ -194,7 +194,9 @@ final class PerspectiveRenderer: NSObject, MTKViewDelegate {
         return out;
     }
 
-    static float3 sampleBlurred(
+    // A compact 11-tap, vertically-biased blur. Large vertical offsets create
+    // the soft defocus seen in the reference without requiring a costly mip chain.
+    static float3 sampleFoldBlur(
         texture2d<float> image,
         sampler s,
         float2 uv,
@@ -203,16 +205,20 @@ final class PerspectiveRenderer: NSObject, MTKViewDelegate {
         if (radius <= 0.05f) return image.sample(s, uv).rgb;
 
         float2 texel = 1.0f / float2(image.get_width(), image.get_height());
-        float2 o = texel * radius;
-        float3 c = image.sample(s, uv).rgb * 0.25f;
-        c += image.sample(s, uv + float2( o.x, 0.0f)).rgb * 0.125f;
-        c += image.sample(s, uv + float2(-o.x, 0.0f)).rgb * 0.125f;
-        c += image.sample(s, uv + float2(0.0f,  o.y)).rgb * 0.125f;
-        c += image.sample(s, uv + float2(0.0f, -o.y)).rgb * 0.125f;
-        c += image.sample(s, uv + float2( o.x,  o.y)).rgb * 0.0625f;
-        c += image.sample(s, uv + float2(-o.x,  o.y)).rgb * 0.0625f;
-        c += image.sample(s, uv + float2( o.x, -o.y)).rgb * 0.0625f;
-        c += image.sample(s, uv + float2(-o.x, -o.y)).rgb * 0.0625f;
+        float rx = radius * 0.55f * texel.x;
+        float ry = radius * 1.15f * texel.y;
+
+        float3 c = image.sample(s, uv).rgb * 0.20f;
+        c += image.sample(s, uv + float2( rx, 0.0f)).rgb * 0.08f;
+        c += image.sample(s, uv + float2(-rx, 0.0f)).rgb * 0.08f;
+        c += image.sample(s, uv + float2(0.0f,  ry)).rgb * 0.11f;
+        c += image.sample(s, uv + float2(0.0f, -ry)).rgb * 0.11f;
+        c += image.sample(s, uv + float2( rx,  ry)).rgb * 0.055f;
+        c += image.sample(s, uv + float2(-rx,  ry)).rgb * 0.055f;
+        c += image.sample(s, uv + float2( rx, -ry)).rgb * 0.055f;
+        c += image.sample(s, uv + float2(-rx, -ry)).rgb * 0.055f;
+        c += image.sample(s, uv + float2(0.0f,  2.15f * ry)).rgb * 0.10f;
+        c += image.sample(s, uv + float2(0.0f, -2.15f * ry)).rgb * 0.10f;
         return c;
     }
 
@@ -233,23 +239,8 @@ final class PerspectiveRenderer: NSObject, MTKViewDelegate {
         float perspective = clamp(u.perspective, 0.0f, 1.0f);
         float softness = clamp(u.softness, 0.0f, 1.0f);
 
-        // The blur front begins at the top and travels downward as the lid closes.
-        // pow(p, 0.58) makes the first part visible early without making the final
-        // transition snap. Standard softness (.25) maps to a 1x blur multiplier.
-        float blurReach = clamp(pow(p, 0.58f), 0.0f, 1.0f);
-        float blurFront = 1.0f - blurReach;
-        float frontFeather = 0.045f + 0.11f * softness;
-        float blurMask = smoothstep(blurFront - frontFeather, blurFront + frontFeather, height);
-        float blurMultiplier = softness > 0.001f ? softness / 0.25f : 0.0f;
-        float maxRadius = (2.0f + 17.0f * pow(p, 0.72f)) * blurMultiplier;
-        float backgroundRadius = maxRadius * blurMask * 1.15f;
-
-        // Full-screen blurred desktop replaces the old black surround. It is only
-        // strongly blurred above the moving front; below that it stays near sharp.
-        float3 background = sampleBlurred(desktop, s, in.uv, backgroundRadius);
-        background *= 1.0f - clamp(u.dimming, 0.0f, 1.0f) * 0.10f * p * blurMask;
-
-        // Inverse perspective around the bottom-center hinge.
+        // Inverse perspective around the bottom-center hinge. The bottom edge is
+        // visually anchored while the upper area contracts inward as the lid closes.
         float verticalScale = max(0.50f, 1.0f - p * mix(0.12f, 0.34f, perspective));
         float sourceHeight = height / verticalScale;
         float taper = p * mix(0.08f, 0.30f, perspective);
@@ -257,8 +248,9 @@ final class PerspectiveRenderer: NSObject, MTKViewDelegate {
         float sourceX = 0.5f + (in.uv.x - 0.5f) / horizontalScale;
         float2 sourceUV = float2(sourceX, 1.0f - sourceHeight);
 
-        // Soft trapezoid boundary for blending foreground into the blurred surround.
-        float edge = 0.0015f + 0.010f * softness;
+        // Reference look: everything outside the transformed desktop stays black.
+        // A wider feather prevents the trapezoid from looking like a hard cut-out.
+        float edge = 0.005f + 0.020f * softness + 0.004f * p;
         float halfWidth = 0.5f * horizontalScale;
         float horizontalDistance = abs(in.uv.x - 0.5f);
         float insideX = 1.0f - smoothstep(max(0.0f, halfWidth - edge), halfWidth, horizontalDistance);
@@ -266,22 +258,42 @@ final class PerspectiveRenderer: NSObject, MTKViewDelegate {
         float mask = insideX * insideTop;
 
         if (mask <= 0.0001f || sourceHeight > 1.001f || sourceX < -0.001f || sourceX > 1.001f) {
-            return float4(background, 1.0f);
+            return float4(0.0f, 0.0f, 0.0f, 1.0f);
         }
 
-        // Apply the same top-to-bottom blur front to transformed content itself.
-        float sourceBlurMask = smoothstep(
-            blurFront - frontFeather,
-            blurFront + frontFeather,
-            clamp(sourceHeight, 0.0f, 1.0f)
-        );
-        float contentRadius = maxRadius * sourceBlurMask;
-        float3 content = sampleBlurred(desktop, s, sourceUV, contentRadius);
-        float shade = 1.0f - clamp(u.dimming, 0.0f, 1.0f) * 0.08f * p * clamp(sourceHeight, 0.0f, 1.0f);
-        content *= shade;
+        float3 sharp = desktop.sample(s, sourceUV).rgb;
 
-        float3 composed = mix(background, content, mask);
-        return float4(composed, 1.0f);
+        // The blur front begins near the top and travels smoothly toward the hinge.
+        // Unlike a narrow threshold, this broad transition produces a continuous
+        // depth-of-field falloff similar to the supplied reference photos.
+        float closeProgress = pow(p, 0.72f);
+        float blurFront = mix(0.94f, 0.04f, closeProgress);
+        float feather = mix(0.18f, 0.34f, softness) + 0.06f * closeProgress;
+        float blurField = smoothstep(blurFront - feather, blurFront + feather, clamp(sourceHeight, 0.0f, 1.0f));
+
+        // Ease the blur itself so the first few degrees remain subtle, then let it
+        // become strongly defocused through the middle and late part of the fold.
+        float blurStrength = smoothstep(0.015f, 0.16f, p);
+        float blurMultiplier = softness > 0.001f ? (0.55f + softness / 0.25f) : 0.0f;
+        float maxRadius = (3.0f + 24.0f * pow(p, 0.78f)) * blurMultiplier;
+        float localRadius = maxRadius * mix(0.42f, 1.0f, blurField);
+        float3 blurred = sampleFoldBlur(desktop, s, sourceUV, localRadius);
+
+        // Blend sharp -> blurred instead of only changing kernel radius. This is
+        // what makes the advancing front look soft rather than like a moving line.
+        float blurMix = clamp(blurField * blurStrength, 0.0f, 1.0f);
+        float3 content = mix(sharp, blurred, blurMix);
+
+        // Closing the lid also introduces a gentle top-heavy darkening. At small
+        // angles most of the upper screen fades into the black surround naturally.
+        float darkField = smoothstep(blurFront - feather * 1.5f,
+                                     blurFront + feather * 1.4f,
+                                     clamp(sourceHeight, 0.0f, 1.0f));
+        float userDim = clamp(u.dimming, 0.0f, 1.0f);
+        float dimAmount = (0.035f * p + 0.22f * p * p * darkField) * (0.75f + userDim);
+        content *= 1.0f - clamp(dimAmount, 0.0f, 0.38f);
+
+        return float4(content * mask, 1.0f);
     }
     """#
 }
