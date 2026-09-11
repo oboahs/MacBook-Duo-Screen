@@ -36,6 +36,8 @@ BINARY="$MACOS_DIR/MacBookDuoScreen"
 PLIST="$CONTENTS_DIR/Info.plist"
 PLIST_EXPECTED="$BUILD_DIR/Info.plist.expected"
 SIGNING_MODE_FILE="$BUILD_DIR/signing-mode.txt"
+TCC_IDENTITY_FILE="$BUILD_DIR/tcc-screen-capture-identity.txt"
+BUNDLE_ID="com.oboahs.MacBookDuoScreen"
 
 mkdir -p "$MACOS_DIR"
 
@@ -130,7 +132,7 @@ sign_app() {
   if [ -n "$stable_identity" ]; then
     echo "正在使用稳定代码签名：$stable_identity"
     if codesign --force --deep --sign "$stable_identity" \
-        --identifier com.oboahs.MacBookDuoScreen "$APP_DIR"; then
+        --identifier "$BUNDLE_ID" "$APP_DIR"; then
       printf 'stable:%s\n' "$stable_identity" > "$SIGNING_MODE_FILE"
       echo "✓ 稳定签名完成"
       return 0
@@ -139,7 +141,7 @@ sign_app() {
   fi
 
   if codesign --force --deep --sign - \
-      --identifier com.oboahs.MacBookDuoScreen "$APP_DIR" >/dev/null 2>&1; then
+      --identifier "$BUNDLE_ID" "$APP_DIR" >/dev/null 2>&1; then
     printf 'adhoc\n' > "$SIGNING_MODE_FILE"
     echo "✓ 本地临时签名完成"
     return 0
@@ -147,6 +149,57 @@ sign_app() {
 
   echo "错误：应用代码签名失败。"
   return 1
+}
+
+current_code_identity() {
+  local cdhash
+  cdhash="$(codesign -dvvv "$APP_DIR" 2>&1 | sed -n 's/^CDHash=//p' | head -n 1)"
+  if [ -n "$cdhash" ]; then
+    printf '%s\n' "$cdhash"
+    return 0
+  fi
+
+  if [ -f "$BINARY" ]; then
+    shasum -a 256 "$BINARY" | awk '{print $1}'
+    return 0
+  fi
+
+  return 1
+}
+
+reset_stale_screen_capture_permission_if_needed() {
+  local signing_mode
+  signing_mode="$(cat "$SIGNING_MODE_FILE" 2>/dev/null || true)"
+
+  # A stable Apple signing identity can survive rebuilds, so it doesn't need the
+  # development-only TCC reset below.
+  if [[ "$signing_mode" != adhoc* ]]; then
+    return 0
+  fi
+
+  local current_identity previous_identity
+  current_identity="$(current_code_identity 2>/dev/null || true)"
+  previous_identity="$(cat "$TCC_IDENTITY_FILE" 2>/dev/null || true)"
+
+  if [ -z "$current_identity" ]; then
+    echo "⚠ 无法读取当前 App 的代码身份；跳过屏幕录制授权清理。"
+    return 0
+  fi
+
+  if [ "$current_identity" = "$previous_identity" ]; then
+    return 0
+  fi
+
+  echo "检测到新的本地临时签名构建。"
+  echo "正在清理旧构建遗留的屏幕录制授权记录……"
+  if tccutil reset ScreenCapture "$BUNDLE_ID" >/dev/null 2>&1; then
+    printf '%s\n' "$current_identity" > "$TCC_IDENTITY_FILE"
+    echo "✓ 已清理旧授权记录。"
+    echo "  本次点击“启用视觉锁定”时，请重新允许一次屏幕录制；之后同一构建不会再次清理。"
+  else
+    echo "⚠ 无法自动清理旧授权记录。"
+    echo "  可手动执行：tccutil reset ScreenCapture $BUNDLE_ID"
+  fi
 }
 
 # IMPORTANT: Never rewrite files inside a signed .app unless their contents
@@ -193,8 +246,7 @@ if [ "$NEED_BUILD" -eq 1 ]; then
   NEED_SIGN=1
 fi
 
-# The previous launcher rewrote Info.plist on every launch, which invalidated the
-# existing signature. Repair that once, then keep the bundle byte-for-byte stable.
+# Repair an invalid signature once, then keep the bundle byte-for-byte stable.
 if [ -x "$BINARY" ] && ! codesign --verify --deep --strict "$APP_DIR" >/dev/null 2>&1; then
   echo "检测到 App 签名失效，正在修复……"
   NEED_SIGN=1
@@ -220,6 +272,12 @@ if [ "$NEED_SIGN" -eq 1 ]; then
   fi
 fi
 
+# Ad-hoc builds receive a new code identity after each rebuild. System Settings
+# can keep showing the old entry as enabled even though it no longer matches the
+# current binary. Reset only when the actual code identity changes, never on every
+# launch of the same build.
+reset_stale_screen_capture_permission_if_needed
+
 if [ "$#" -gt 0 ]; then
   "$BINARY" "$@"
   STATUS=$?
@@ -239,7 +297,7 @@ fi
 
 echo "✓ MacBook Duo Screen 2.0 已启动。"
 if [ -f "$SIGNING_MODE_FILE" ] && grep -q '^adhoc' "$SIGNING_MODE_FILE"; then
-  echo "当前为本地临时签名；只要源码/Info.plist 不变化，同一构建不会在启动时被重新签名或改写。"
+  echo "当前为本地临时签名；同一构建不会重复改写、签名或重置屏幕录制权限。"
 fi
 echo "请点击菜单栏角度，选择“启用视觉锁定”。"
 echo "这个终端窗口可以直接关闭。"
