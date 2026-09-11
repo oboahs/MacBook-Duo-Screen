@@ -32,6 +32,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var startingCapture = false
     private var statusMessage = "待机"
 
+    // The system menu bar is hidden only while the transformed overlay is visible.
+    // Opening the lid back to the reference angle restores it automatically.
+    private var menuBarHiddenForEffect = false
+    private var menuBarWasVisible = true
+
     private let referenceKey = "perspectiveReferenceAngle"
     private let strengthKey = "perspectiveStrength"
     private let softnessKey = "perspectiveSoftness"
@@ -89,6 +94,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         timer?.invalidate()
         capture.stop()
         hideOverlay()
+        restoreMenuBarIfNeeded()
         panel?.close()
     }
 
@@ -159,9 +165,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         do {
             latestSample = filter.update(rawAngle: try sensor.readAngle())
             updateStatusTitle()
-            if enabled {
-                updateOverlayVisibility()
-            }
+            if enabled { updateOverlayVisibility() }
         } catch {
             sensorError = error.localizedDescription
             self.sensor = nil
@@ -171,8 +175,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func compensationAmount() -> Double {
-        // Same easing family as MacDuo's Duo effect, but the reference angle is
-        // calibrated from the user's current working position instead of fixed.
         let clear = min(150.0, max(60.0, referenceAngle))
         guard clear > 6 else { return 0 }
         let t = min(1.0, max(0.0, (clear - latestSample.angle) / (clear - 5.0)))
@@ -186,8 +188,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        let amount = compensationAmount()
-        if amount > 0.0005 {
+        if compensationAmount() > 0.0005 {
             showOverlay()
         } else {
             hideOverlay()
@@ -275,16 +276,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return (screen, displayID)
     }
 
+    private func hideMenuBarForEffect() {
+        guard !menuBarHiddenForEffect else { return }
+        menuBarWasVisible = NSMenu.menuBarVisible()
+        if menuBarWasVisible {
+            NSMenu.setMenuBarVisible(false)
+        }
+        menuBarHiddenForEffect = true
+    }
+
+    private func restoreMenuBarIfNeeded() {
+        guard menuBarHiddenForEffect else { return }
+        if menuBarWasVisible {
+            NSMenu.setMenuBarVisible(true)
+        }
+        menuBarHiddenForEffect = false
+    }
+
     private func showOverlay() {
-        guard !overlayVisible, let panel else { return }
+        guard let panel else { return }
+        hideMenuBarForEffect()
+        guard !overlayVisible else { return }
         panel.orderFrontRegardless()
         overlayVisible = true
     }
 
     private func hideOverlay() {
-        guard overlayVisible else { return }
-        panel?.orderOut(nil)
-        overlayVisible = false
+        if overlayVisible {
+            panel?.orderOut(nil)
+            overlayVisible = false
+        }
+        restoreMenuBarIfNeeded()
     }
 
     private func enableEffect() {
@@ -297,7 +319,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         referenceAngle = latestSample.angle
         startingCapture = true
-        statusMessage = "正在请求屏幕录制权限…"
+        statusMessage = "正在连接屏幕捕获…"
         rebuildMenu()
 
         Task { [weak self] in
@@ -310,8 +332,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let prepared = try self.prepareOverlay()
                 try await self.capture.verifyAccess()
 
-                // Intel machines prefer a 30 fps capture stream. Metal still
-                // presents at 60 Hz so angle animation stays responsive.
                 let scale = prepared.screen.backingScaleFactor
                 let nativeWidth = Int(prepared.screen.frame.width * scale)
                 let nativeHeight = Int(prepared.screen.frame.height * scale)
@@ -407,8 +427,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         perspectiveItem.submenu = perspectiveMenu
         statusMenu.addItem(perspectiveItem)
 
-        let softnessItem = NSMenuItem(title: "运动柔化", action: nil, keyEquivalent: "")
-        let softnessMenu = NSMenu(title: "运动柔化")
+        let softnessItem = NSMenuItem(title: "纵向模糊", action: nil, keyEquivalent: "")
+        let softnessMenu = NSMenu(title: "纵向模糊")
         for (label, value, tag) in [("关闭", 0.0, 0), ("低", 0.15, 15), ("标准", 0.25, 25), ("高", 0.45, 45)] {
             let item = NSMenuItem(title: label, action: #selector(selectSoftness(_:)), keyEquivalent: "")
             item.target = self
@@ -488,7 +508,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func showAbout(_ sender: NSMenuItem) {
         let alert = NSAlert()
         alert.messageText = "MacBook Duo Screen · Perspective Lock"
-        alert.informativeText = "当前版本不再修改窗口布局。它实时捕获内置屏幕，并根据 LAS 转轴角度对整块桌面做反向透视补偿，让屏幕开合时内容在视觉上更像固定在空间中。\n\n第一次启用需要允许“屏幕录制”。覆盖层不会拦截鼠标，但在大角度补偿时，视觉位置与真实点击位置暂时不会完全一致。"
+        alert.informativeText = "程序实时捕获内置屏幕，并根据 LAS 转轴角度对整块桌面做反向透视补偿。透视动画出现时系统菜单栏会暂时隐藏；打开回视觉基准角度后自动恢复。\n\n模糊从屏幕顶部开始，随着合盖逐渐向下扩散，并用模糊桌面替代透视图像周围原来的纯黑区域。覆盖层不会拦截鼠标，但大角度补偿时视觉位置与真实点击位置暂时不会完全一致。"
         alert.addButton(withTitle: "好")
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
@@ -501,7 +521,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func showWelcome() {
         let alert = NSAlert()
         alert.messageText = "Perspective Lock 已就绪"
-        alert.informativeText = "这版已经改成你需要的方向：不会再调整两个窗口。\n\n点击菜单栏角度 →“启用视觉锁定”。程序会把启用时的屏幕角度作为视觉基准；之后向下合屏时，桌面内容会围绕底部转轴做反向透视补偿。第一次启用需要授予屏幕录制权限。"
+        alert.informativeText = "点击菜单栏角度 →“启用视觉锁定”。程序会把启用时的屏幕角度作为视觉基准；向下合屏时，桌面内容围绕底部转轴做反向透视补偿。\n\n透视动画开始后菜单栏会自动隐藏；合盖越深，模糊会从顶部逐渐向下扩散。"
         alert.addButton(withTitle: "知道了")
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
