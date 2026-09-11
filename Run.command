@@ -34,6 +34,7 @@ CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 BINARY="$MACOS_DIR/MacBookDuoScreen"
 PLIST="$CONTENTS_DIR/Info.plist"
+SIGNING_MODE_FILE="$BUILD_DIR/signing-mode.txt"
 
 mkdir -p "$MACOS_DIR"
 
@@ -100,6 +101,62 @@ write_plist() {
 PLIST_EOF
 }
 
+find_stable_signing_identity() {
+  # Explicit override for advanced/local development use.
+  if [ -n "${MDS_SIGNING_IDENTITY:-}" ]; then
+    printf '%s\n' "$MDS_SIGNING_IDENTITY"
+    return 0
+  fi
+
+  local identities
+  identities="$(security find-identity -v -p codesigning 2>/dev/null || true)"
+
+  # Prefer a normal Apple Development identity. It gives the app a stable
+  # designated requirement, so TCC can remember Screen Recording permission
+  # across rebuilds. Older Xcode certificates used the Mac Developer name.
+  local identity
+  identity="$(printf '%s\n' "$identities" | sed -n 's/.*"\(Apple Development: [^"]*\)".*/\1/p' | head -n 1)"
+  if [ -z "$identity" ]; then
+    identity="$(printf '%s\n' "$identities" | sed -n 's/.*"\(Mac Developer: [^"]*\)".*/\1/p' | head -n 1)"
+  fi
+  if [ -z "$identity" ]; then
+    identity="$(printf '%s\n' "$identities" | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -n 1)"
+  fi
+
+  printf '%s\n' "$identity"
+}
+
+sign_app() {
+  local stable_identity
+  stable_identity="$(find_stable_signing_identity)"
+
+  if [ -n "$stable_identity" ]; then
+    echo "正在使用稳定代码签名：$stable_identity"
+    if codesign --force --deep --sign "$stable_identity" \
+        --identifier com.oboahs.MacBookDuoScreen "$APP_DIR"; then
+      printf 'stable:%s\n' "$stable_identity" > "$SIGNING_MODE_FILE"
+      echo "✓ 稳定签名完成（屏幕录制权限可跨后续构建保留）"
+      return 0
+    fi
+    echo "⚠ 稳定签名失败，将退回临时签名。"
+  fi
+
+  # Ad-hoc signing is enough to run locally, but its designated requirement is
+  # tied to this exact build. macOS may therefore ask for Screen Recording again
+  # after the source code changes and the binary is rebuilt.
+  if codesign --force --deep --sign - \
+      --identifier com.oboahs.MacBookDuoScreen "$APP_DIR" >/dev/null 2>&1; then
+    printf 'adhoc\n' > "$SIGNING_MODE_FILE"
+    echo "⚠ 当前使用临时 ad-hoc 签名。"
+    echo "  本次构建授权后可正常使用，但下一次源码更新重新编译时，macOS 可能再次要求屏幕录制权限。"
+    echo "  如果钥匙串中安装 Apple Development 证书，脚本会自动切换到稳定签名。"
+    return 0
+  fi
+
+  echo "错误：应用代码签名失败。"
+  return 1
+}
+
 write_plist
 
 if [ "$NEED_BUILD" -eq 1 ]; then
@@ -113,6 +170,7 @@ if [ "$NEED_BUILD" -eq 1 ]; then
   if ! xcrun swiftc -O "${SOURCE_FILES[@]}" \
       -o "$BINARY" \
       -framework AppKit \
+      -framework CoreGraphics \
       -framework IOKit \
       -framework CoreFoundation \
       -framework CoreMedia \
@@ -127,10 +185,12 @@ if [ "$NEED_BUILD" -eq 1 ]; then
   fi
 
   chmod +x "$BINARY"
-  if command -v codesign >/dev/null 2>&1; then
-    codesign --force --deep --sign - "$APP_DIR" >/dev/null 2>&1 || true
-  fi
   echo "✓ 编译完成"
+
+  if ! sign_app; then
+    pause_before_exit
+    exit 1
+  fi
 fi
 
 if [ "$#" -gt 0 ]; then
@@ -151,7 +211,10 @@ if [ "$STATUS" -ne 0 ]; then
 fi
 
 echo "✓ MacBook Duo Screen 2.0 已启动。"
+if [ -f "$SIGNING_MODE_FILE" ] && grep -q '^adhoc' "$SIGNING_MODE_FILE"; then
+  echo "提示：当前构建使用临时签名；源码再次更新并重新编译后，macOS 可能要求重新授权屏幕录制。"
+fi
 echo "请点击菜单栏角度，选择“启用视觉锁定”。"
-echo "首次启用时 macOS 会请求“屏幕录制”权限。"
+echo "若首次授权屏幕录制，授权后请退出应用并重新双击 Run.command。"
 echo "这个终端窗口可以直接关闭。"
 exit 0
