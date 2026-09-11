@@ -32,14 +32,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var startingCapture = false
     private var statusMessage = "待机"
 
-    // The system menu bar is hidden only while the transformed overlay is visible.
-    // Opening the lid back to the reference angle restores it automatically.
-    private var menuBarHiddenForEffect = false
-    private var menuBarWasVisible = true
-
     private let referenceKey = "perspectiveReferenceAngle"
     private let strengthKey = "perspectiveStrength"
-    private let softnessKey = "perspectiveSoftness"
+    private let blurKey = "gaussianBlurStrengthV3"
     private let perspectiveKey = "perspectiveDepth"
     private let welcomeKey = "welcomeShownV2"
 
@@ -51,20 +46,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         set { defaults.set(newValue, forKey: referenceKey) }
     }
 
+    /// 0.5...3.0. Unlike the old implementation this is not folded into the
+    /// 0...1 lid progress, so values above 100% really increase geometry strength.
     private var strength: Double {
         get {
             let saved = defaults.double(forKey: strengthKey)
-            return saved > 0 ? saved : 1.0
+            return saved > 0 ? min(3.0, max(0.5, saved)) : 1.0
         }
-        set { defaults.set(newValue, forKey: strengthKey) }
+        set { defaults.set(min(3.0, max(0.5, newValue)), forKey: strengthKey) }
     }
 
-    private var softness: Double {
+    /// 0...1. A new key intentionally resets the previous subtle blur setting.
+    /// 60% maps to roughly 38 px Gaussian sigma at the capture resolution.
+    private var blurStrength: Double {
         get {
-            if defaults.object(forKey: softnessKey) == nil { return 0.25 }
-            return defaults.double(forKey: softnessKey)
+            if defaults.object(forKey: blurKey) == nil { return 0.60 }
+            return min(1.0, max(0.0, defaults.double(forKey: blurKey)))
         }
-        set { defaults.set(newValue, forKey: softnessKey) }
+        set { defaults.set(min(1.0, max(0.0, newValue)), forKey: blurKey) }
     }
 
     private var perspectiveDepth: Double {
@@ -94,7 +93,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         timer?.invalidate()
         capture.stop()
         hideOverlay()
-        restoreMenuBarIfNeeded()
         panel?.close()
     }
 
@@ -174,12 +172,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func compensationAmount() -> Double {
+    /// Pure 0...1 angle progress. Strength is intentionally applied only in the shader.
+    private func compensationProgress() -> Double {
         let clear = min(150.0, max(60.0, referenceAngle))
         guard clear > 6 else { return 0 }
         let t = min(1.0, max(0.0, (clear - latestSample.angle) / (clear - 5.0)))
-        let eased = t * t * (3.0 - 2.0 * t)
-        return min(1.0, max(0.0, eased * strength))
+        return t * t * (3.0 - 2.0 * t)
     }
 
     private func updateOverlayVisibility() {
@@ -188,7 +186,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        if compensationAmount() > 0.0005 {
+        if compensationProgress() > 0.0005 {
             showOverlay()
         } else {
             hideOverlay()
@@ -199,7 +197,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let angle = Int(round(latestSample.angle))
         let prefix = enabled ? "P" : ""
         statusItem.button?.title = "\(prefix)\(angle)°"
-        statusItem.button?.toolTip = "当前 \(String(format: "%.1f", latestSample.angle))° · 基准 \(String(format: "%.1f", referenceAngle))° · \(latestSample.directionText)"
+        statusItem.button?.toolTip = "当前 \(String(format: "%.1f", latestSample.angle))° · 基准 \(String(format: "%.1f", referenceAngle))° · 补偿 \(Int(round(strength * 100)))% · 高斯模糊 \(Int(round(blurStrength * 100)))%"
     }
 
     private func builtInScreen() -> NSScreen? {
@@ -232,12 +230,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             renderer.parameters = { [weak self] in
                 guard let self else { return PerspectiveUniforms() }
                 return PerspectiveUniforms(
-                    amount: Float(self.compensationAmount()),
+                    amount: Float(self.compensationProgress()),
                     perspective: Float(self.perspectiveDepth),
-                    softness: Float(self.softness),
+                    softness: Float(self.blurStrength),
                     dimming: 0.15,
                     size: SIMD2<Float>(1, 1),
-                    padding: SIMD2<Float>(0, 0)
+                    padding: SIMD2<Float>(Float(self.strength), 0)
                 )
             }
             renderer.onFailure = { [weak self] reason in
@@ -251,7 +249,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 defer: false,
                 screen: screen
             )
-            panel.level = .floating
+            panel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.statusWindow)) + 1)
             panel.isOpaque = true
             panel.backgroundColor = .black
             panel.hasShadow = false
@@ -276,37 +274,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return (screen, displayID)
     }
 
-    private func hideMenuBarForEffect() {
-        guard !menuBarHiddenForEffect else { return }
-        menuBarWasVisible = NSMenu.menuBarVisible()
-        if menuBarWasVisible {
-            NSMenu.setMenuBarVisible(false)
-        }
-        menuBarHiddenForEffect = true
-    }
-
-    private func restoreMenuBarIfNeeded() {
-        guard menuBarHiddenForEffect else { return }
-        if menuBarWasVisible {
-            NSMenu.setMenuBarVisible(true)
-        }
-        menuBarHiddenForEffect = false
-    }
-
     private func showOverlay() {
-        guard let panel else { return }
-        hideMenuBarForEffect()
-        guard !overlayVisible else { return }
+        guard !overlayVisible, let panel else { return }
         panel.orderFrontRegardless()
         overlayVisible = true
     }
 
     private func hideOverlay() {
-        if overlayVisible {
-            panel?.orderOut(nil)
-            overlayVisible = false
-        }
-        restoreMenuBarIfNeeded()
+        guard overlayVisible else { return }
+        panel?.orderOut(nil)
+        overlayVisible = false
     }
 
     private func enableEffect() {
@@ -382,7 +359,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             addDisabledItem("LAS：未连接")
         }
         addDisabledItem("视觉基准：\(String(format: "%.1f", referenceAngle))°")
-        addDisabledItem("补偿量：\(Int(round(compensationAmount() * 100)))%")
+        addDisabledItem("合盖进度：\(Int(round(compensationProgress() * 100)))%")
         addDisabledItem("状态：\(statusMessage)")
         statusMenu.addItem(.separator())
 
@@ -401,18 +378,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         calibrate.isEnabled = sensor != nil
         statusMenu.addItem(calibrate)
 
-        let strengthItem = NSMenuItem(title: "补偿强度", action: nil, keyEquivalent: "")
-        let strengthMenu = NSMenu(title: "补偿强度")
-        for (label, value, tag) in [("70%", 0.7, 70), ("85%", 0.85, 85), ("100%", 1.0, 100), ("115%", 1.15, 115)] {
-            let item = NSMenuItem(title: label, action: #selector(selectStrength(_:)), keyEquivalent: "")
-            item.target = self
-            item.tag = tag
-            item.representedObject = value
-            item.state = abs(strength - value) < 0.001 ? .on : .off
-            strengthMenu.addItem(item)
-        }
-        strengthItem.submenu = strengthMenu
-        statusMenu.addItem(strengthItem)
+        statusMenu.addItem(.separator())
+        statusMenu.addItem(makeSliderItem(
+            title: "补偿强度",
+            value: strength * 100,
+            minValue: 50,
+            maxValue: 300,
+            valueTag: 9101,
+            action: #selector(compensationSliderChanged(_:))
+        ))
+        statusMenu.addItem(makeSliderItem(
+            title: "高斯模糊",
+            value: blurStrength * 100,
+            minValue: 0,
+            maxValue: 100,
+            valueTag: 9102,
+            action: #selector(blurSliderChanged(_:))
+        ))
 
         let perspectiveItem = NSMenuItem(title: "透视补偿", action: nil, keyEquivalent: "")
         let perspectiveMenu = NSMenu(title: "透视补偿")
@@ -426,19 +408,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         perspectiveItem.submenu = perspectiveMenu
         statusMenu.addItem(perspectiveItem)
-
-        let softnessItem = NSMenuItem(title: "纵向模糊", action: nil, keyEquivalent: "")
-        let softnessMenu = NSMenu(title: "纵向模糊")
-        for (label, value, tag) in [("关闭", 0.0, 0), ("低", 0.15, 15), ("标准", 0.25, 25), ("高", 0.45, 45)] {
-            let item = NSMenuItem(title: label, action: #selector(selectSoftness(_:)), keyEquivalent: "")
-            item.target = self
-            item.tag = tag
-            item.representedObject = value
-            item.state = abs(softness - value) < 0.001 ? .on : .off
-            softnessMenu.addItem(item)
-        }
-        softnessItem.submenu = softnessMenu
-        statusMenu.addItem(softnessItem)
 
         statusMenu.addItem(.separator())
 
@@ -460,6 +429,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusMenu.addItem(quit)
     }
 
+    private func makeSliderItem(
+        title: String,
+        value: Double,
+        minValue: Double,
+        maxValue: Double,
+        valueTag: Int,
+        action: Selector
+    ) -> NSMenuItem {
+        let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        let view = NSView(frame: NSRect(x: 0, y: 0, width: 292, height: 58))
+
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = NSFont.systemFont(ofSize: 12.5, weight: .medium)
+        titleLabel.frame = NSRect(x: 14, y: 34, width: 170, height: 17)
+        view.addSubview(titleLabel)
+
+        let valueLabel = NSTextField(labelWithString: "\(Int(round(value)))%")
+        valueLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        valueLabel.alignment = .right
+        valueLabel.tag = valueTag
+        valueLabel.frame = NSRect(x: 205, y: 34, width: 72, height: 17)
+        view.addSubview(valueLabel)
+
+        let slider = NSSlider(
+            value: value,
+            minValue: minValue,
+            maxValue: maxValue,
+            target: self,
+            action: action
+        )
+        slider.isContinuous = true
+        slider.numberOfTickMarks = 6
+        slider.allowsTickMarkValuesOnly = false
+        slider.frame = NSRect(x: 12, y: 7, width: 266, height: 24)
+        view.addSubview(slider)
+
+        item.view = view
+        return item
+    }
+
+    private func updateSliderLabel(_ slider: NSSlider, tag: Int) {
+        guard let label = slider.superview?.viewWithTag(tag) as? NSTextField else { return }
+        label.stringValue = "\(Int(round(slider.doubleValue)))%"
+    }
+
     private func addDisabledItem(_ title: String) {
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         item.isEnabled = false
@@ -479,18 +493,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildMenu()
     }
 
-    @objc private func selectStrength(_ sender: NSMenuItem) {
-        if let value = sender.representedObject as? Double { strength = value }
-        rebuildMenu()
+    @objc private func compensationSliderChanged(_ sender: NSSlider) {
+        strength = sender.doubleValue / 100.0
+        updateSliderLabel(sender, tag: 9101)
+        updateStatusTitle()
+    }
+
+    @objc private func blurSliderChanged(_ sender: NSSlider) {
+        blurStrength = sender.doubleValue / 100.0
+        updateSliderLabel(sender, tag: 9102)
+        updateStatusTitle()
     }
 
     @objc private func selectPerspective(_ sender: NSMenuItem) {
         if let value = sender.representedObject as? Double { perspectiveDepth = value }
-        rebuildMenu()
-    }
-
-    @objc private func selectSoftness(_ sender: NSMenuItem) {
-        if let value = sender.representedObject as? Double { softness = value }
         rebuildMenu()
     }
 
@@ -508,7 +524,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func showAbout(_ sender: NSMenuItem) {
         let alert = NSAlert()
         alert.messageText = "MacBook Duo Screen · Perspective Lock"
-        alert.informativeText = "程序实时捕获内置屏幕，并根据 LAS 转轴角度对整块桌面做反向透视补偿。透视动画出现时系统菜单栏会暂时隐藏；打开回视觉基准角度后自动恢复。\n\n模糊从屏幕顶部开始，随着合盖逐渐向下扩散，并用模糊桌面替代透视图像周围原来的纯黑区域。覆盖层不会拦截鼠标，但大角度补偿时视觉位置与真实点击位置暂时不会完全一致。"
+        alert.informativeText = "程序实时捕获内置屏幕，并根据 LAS 转轴角度对整块桌面做反向透视补偿。覆盖层位于系统菜单栏之上，因此菜单栏也会一起进入视觉效果。\n\n补偿强度可在 50%–300% 连续调节；高斯模糊使用 Metal Performance Shaders 的 GPU 高斯核，可在 0%–100% 连续调节。模糊从屏幕顶部开始，随着合盖逐渐向底部扩散。"
         alert.addButton(withTitle: "好")
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
@@ -521,7 +537,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func showWelcome() {
         let alert = NSAlert()
         alert.messageText = "Perspective Lock 已就绪"
-        alert.informativeText = "点击菜单栏角度 →“启用视觉锁定”。程序会把启用时的屏幕角度作为视觉基准；向下合屏时，桌面内容围绕底部转轴做反向透视补偿。\n\n透视动画开始后菜单栏会自动隐藏；合盖越深，模糊会从顶部逐渐向下扩散。"
+        alert.informativeText = "点击菜单栏角度 →“启用视觉锁定”。程序会把启用时的屏幕角度作为视觉基准；向下合屏时，桌面内容围绕底部转轴做反向透视补偿。\n\n现在可用滑块连续调整 50%–300% 补偿强度和 0%–100% GPU 高斯模糊强度。"
         alert.addButton(withTitle: "知道了")
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
