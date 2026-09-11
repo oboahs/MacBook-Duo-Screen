@@ -191,6 +191,19 @@ if [ "$NEED_BUILD" -eq 1 ]; then
     pause_before_exit
     exit 1
   fi
+else
+  # A developer certificate may have been created after this binary was already
+  # built with ad-hoc signing. Upgrade the existing .app immediately instead of
+  # waiting for another source-code change to trigger a rebuild.
+  STABLE_IDENTITY="$(find_stable_signing_identity)"
+  CURRENT_SIGNING_MODE="$(cat "$SIGNING_MODE_FILE" 2>/dev/null || true)"
+  if [ -n "$STABLE_IDENTITY" ] && [ "$CURRENT_SIGNING_MODE" != "stable:$STABLE_IDENTITY" ]; then
+    echo "检测到稳定代码签名证书，正在升级现有 App 签名……"
+    if ! sign_app; then
+      pause_before_exit
+      exit 1
+    fi
+  fi
 fi
 
 if [ "$#" -gt 0 ]; then
